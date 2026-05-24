@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GBM-AID | Klinik Karar Destek Sistemi</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ═══ Top bar ═══════════════════════════════════════════ -->
+<header class="topbar">
+  <div class="topbar-logo">
+    <div class="logo-mark">G</div>
+    <span>GBM-AID</span>
+  </div>
+  <nav class="topbar-nav">
+    <a href="#" data-page="analysis" class="active">Analiz</a>
+    <a href="#" data-page="records">Hasta Kayitlari</a>
+    <a href="#" data-page="database">Veritabani</a>
+    <a href="#" data-page="reports">Raporlar</a>
+    <a href="#" data-page="help">Yardim</a>
+  </nav>
+  <span class="topbar-version">GA-DS02-REV3 | nnU-Net + XAI/RAG</span>
+</header>
+
+<!-- ═══ Page header ═══════════════════════════════════════ -->
+<div class="page-header">
+  <div>
+    <div class="breadcrumb">
+      <a href="#" onclick="switchPage('analysis');return false">Ana Sayfa</a>
+      <span class="sep">/</span>
+      <span id="breadcrumb-current">Analiz</span>
+    </div>
+    <div class="page-title" id="page-title">Yeni Analiz Baslat</div>
+  </div>
+  <span class="version-badge">v5.0.0</span>
+</div>
+
+<!-- ═══ Step wizard ═══════════════════════════════════════ -->
+<div class="stepper-wrap">
+  <div class="stepper">
+    <div class="step active">
+      <div class="step-circle">1</div>
+      <div class="step-label">Dosya Yukleme</div>
+    </div>
+    <div class="step-line"></div>
+    <div class="step">
+      <div class="step-circle">2</div>
+      <div class="step-label">Sekans Eslestirme</div>
+    </div>
+    <div class="step-line"></div>
+    <div class="step">
+      <div class="step-circle">3</div>
+      <div class="step-label">Klinik Veri</div>
+    </div>
+    <div class="step-line"></div>
+    <div class="step">
+      <div class="step-circle">4</div>
+      <div class="step-label">Analiz</div>
+    </div>
+    <div class="step-line"></div>
+    <div class="step">
+      <div class="step-circle">5</div>
+      <div class="step-label">Sonuclar</div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Loader ════════════════════════════════════════════ -->
+<div id="loader" class="loader-overlay">
+  <div class="loader-spinner"></div>
+  <div class="loader-label" id="loader-label">Yukleniyor...</div>
+</div>
+
+<!-- ═══ Content ═══════════════════════════════════════════ -->
+<div class="container">
+
+  <!-- ━━━ PAGE: ANALYSIS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div id="page-analysis" class="page active">
+
+    <!-- Input area -->
+    <div id="analysis-input-area">
+
+      <div class="grid-2col">
+
+        <!-- LEFT: Upload -->
+        <div>
+          <div class="card">
+            <div class="section-head">
+              <div class="section-title">MR G&Ouml;R&Uuml;NT&Uuml; DOSYALARI</div>
+              <span class="section-badge" id="file-count">0 dosya</span>
+            </div>
+            <div class="card-body">
+              <div id="upload-zone" class="upload-zone">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                  <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                </svg>
+                <div class="upload-text">Dosyalari surukleyin veya secin</div>
+                <div class="upload-hint">NIfTI &middot; DICOM &middot; NRRD &middot; MHA &middot; PNG &middot; JPG</div>
+                <div class="upload-btns">
+                  <button class="btn btn-primary" type="button" onclick="triggerFileSelect()">Dosya Sec</button>
+                  <button class="btn btn-green" type="button" onclick="triggerFileSelect()">Klasor Sec (TCGA)</button>
+                </div>
+              </div>
+              <input type="file" id="file-input" multiple accept=".nii,.nii.gz,.gz,.dcm,.nrrd,.mha,.png,.jpg" style="display:none">
+              <div class="upload-info">
+                T1, T2, FLAIR, T1ce ve mask (whole/core/enh) dosyalari otomatik taninir.
+                TCGA klasoru secince hasta verileri otomatik dolar.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: Sequence matching -->
+        <div>
+          <div class="card">
+            <div class="section-head">
+              <div class="section-title">SEKANS ESLESTIRME</div>
+              <span class="section-badge">Oto-tahmin &middot; Duzenlenebilir</span>
+            </div>
+            <div id="match-info-banner" style="display:none;padding:10px 20px;font-size:13px;background:var(--bg);border-bottom:1px solid var(--border-light)"></div>
+            <table class="match-table">
+              <thead>
+                <tr>
+                  <th>Dosya Adi</th>
+                  <th>Tahmin</th>
+                  <th>Guven</th>
+                  <th>Sekans</th>
+                </tr>
+              </thead>
+              <tbody id="match-tbody">
+                <tr><td colspan="4" class="match-empty" id="match-empty">Dosya yuklenince gorunecek</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Clinical form -->
+      <div id="clinical-section" style="display:none">
+        <div class="card">
+          <div class="section-head">
+            <div class="section-title">KLINIK HASTA BILGILERI</div>
+          </div>
+          <div class="card-body">
+
+            <div class="form-group">
+              <label class="form-label">Hasta Adi / TCGA ID</label>
+              <input type="text" id="inp-pid" class="form-input" placeholder="orn. TCGA-02-0003 veya Ali Yildiz" style="max-width:480px">
+            </div>
+
+            <div class="grid-4col">
+              <div class="form-group">
+                <label class="form-label">Yas</label>
+                <input type="number" id="inp-age" class="form-input" value="58" min="0" max="120">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Cinsiyet</label>
+                <select id="inp-gender" class="form-select">
+                  <option value="unknown">Secin</option>
+                  <option value="M">Erkek</option>
+                  <option value="F">Kadin</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">KPS Skoru</label>
+                <select id="inp-kps" class="form-select">
+                  <option value="">Secin</option>
+                  <option value="100">100</option>
+                  <option value="90">90</option>
+                  <option value="80" selected>80</option>
+                  <option value="70">70</option>
+                  <option value="60">60</option>
+                  <option value="50">50</option>
+                  <option value="40">40</option>
+                  <option value="30">30</option>
+                  <option value="20">20</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Tedavi</label>
+                <select id="inp-treatment" class="form-select">
+                  <option value="stupp">Stupp Protokolu</option>
+                  <option value="surgery_only">Sadece Cerrahi</option>
+                  <option value="rt_only">Sadece Radyoterapi</option>
+                  <option value="tmz_only">Sadece TMZ</option>
+                  <option value="bev">Bevacizumab</option>
+                  <option value="other">Diger</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="grid-2col" style="max-width:720px">
+              <div class="form-group">
+                <label class="form-label">MGMT Metilasyonu</label>
+                <select id="inp-mgmt" class="form-select">
+                  <option value="unknown">Bilinmiyor</option>
+                  <option value="methylated">Metile</option>
+                  <option value="unmethylated">Metile Degil</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">IDH Mutasyonu</label>
+                <select id="inp-idh1" class="form-select">
+                  <option value="unknown">Bilinmiyor</option>
+                  <option value="mutant">Mutant</option>
+                  <option value="wildtype">Wildtype</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="display:flex;align-items:center;gap:12px;margin-top:18px">
+              <button class="btn btn-primary btn-lg" onclick="runAnalysis()">&#9654; Analizi Baslat</button>
+              <button class="btn btn-outline" onclick="resetAnalysis()">&#8635; Sifirla</button>
+              <span style="font-size:12px;color:var(--text-muted)" id="file-ready-hint">En az 1 dosya yukleyin</span>
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Results area -->
+    <div id="analysis-results-area" style="display:none">
+
+      <!-- Success banner -->
+      <div class="banner-success">
+        <div class="banner-left">
+          <div class="banner-check">&#10003;</div>
+          <div>
+            <div class="banner-title">Analiz Tamamlandi</div>
+            <div class="banner-sub" id="res-report-id"></div>
+          </div>
+        </div>
+        <div class="banner-actions">
+          <button class="btn btn-outline" onclick="goToRecords()">Hasta Kayitlari</button>
+          <button class="btn btn-outline" onclick="goToNewAnalysis()">&larr; Yeni Analiz</button>
+        </div>
+      </div>
+
+      <!-- KPI row -->
+      <div class="kpi-row">
+        <div class="kpi-card">
+          <div class="kpi-label">6 Aylik Sagkalim</div>
+          <div class="kpi-value" id="kpi-surv">-</div>
+          <div class="kpi-sub">AI model tahmini</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Tumor Hacmi</div>
+          <div class="kpi-value" id="kpi-vol">-</div>
+          <div class="kpi-sub">cm&sup3;</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Risk Skoru</div>
+          <div class="kpi-value" id="kpi-risk">-</div>
+          <div class="kpi-sub">0 &mdash; 100</div>
+        </div>
+      </div>
+
+      <!-- Main results grid -->
+      <div class="grid-2col">
+
+        <!-- Left: Survival & Risk -->
+        <div>
+          <div class="card">
+            <div class="section-head">
+              <div class="section-title">SAGKALIM VE RISK</div>
+            </div>
+            <div class="card-body">
+
+              <div class="risk-section">
+                <div class="risk-row">
+                  <span class="risk-row-label">6 Aylik Sagkalim</span>
+                  <span class="risk-row-value" id="surv-val">-</span>
+                </div>
+                <div class="progress-bar"><div class="progress-fill" id="surv-fill" style="width:0%"></div></div>
+              </div>
+
+              <div class="risk-section">
+                <div class="risk-row">
+                  <span class="risk-row-label">Risk Skoru</span>
+                  <span id="risk-badge" class="risk-badge medium">-</span>
+                </div>
+                <div class="risk-slider-wrap">
+                  <div class="risk-gradient"></div>
+                  <div class="risk-marker" id="risk-marker" style="left:50%"></div>
+                </div>
+                <div class="risk-labels">
+                  <span>Dusuk</span>
+                  <span>Orta</span>
+                  <span>Yuksek</span>
+                </div>
+              </div>
+
+              <div style="margin-top:18px">
+                <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;color:var(--text-muted);margin-bottom:10px">Tumor Bolumleri</div>
+                <div class="vol-cards">
+                  <div class="vol-card whole">
+                    <div class="vol-card-label">Whole</div>
+                    <div class="vol-card-value" id="vol-whole">-</div>
+                    <div class="vol-card-unit">cm&sup3;</div>
+                  </div>
+                  <div class="vol-card core">
+                    <div class="vol-card-label">Core</div>
+                    <div class="vol-card-value" id="vol-core">-</div>
+                    <div class="vol-card-unit">cm&sup3;</div>
+                  </div>
+                  <div class="vol-card enh">
+                    <div class="vol-card-label">Enh.</div>
+                    <div class="vol-card-value" id="vol-enh">-</div>
+                    <div class="vol-card-unit">cm&sup3;</div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+          <!-- Projection -->
+          <div class="card">
+            <div class="section-head">
+              <div class="section-title">TUMOR PROJEKSIYON</div>
+              <span class="section-badge">6 Ay / RANO</span>
+            </div>
+            <div class="card-body" id="proj-content"></div>
+          </div>
+        </div>
+
+        <!-- Right: Viewer -->
+        <div>
+          <div class="card" style="overflow:hidden">
+            <div class="section-head">
+              <div class="section-title">TUMOR GORUNTULEME</div>
+            </div>
+            <div class="viewer-container">
+              <div class="viewer-image-wrap">
+                <img id="viewer-img" src="" alt="MRI Viewer">
+                <span class="viewer-overlay-tl" id="viewer-axis-label">AXIAL Z=0</span>
+                <span class="viewer-overlay-tr" id="viewer-dim">-</span>
+                <span class="viewer-overlay-br">Overlay: autumn, &alpha;=0.5</span>
+              </div>
+              <div class="viewer-controls">
+                <div class="viewer-axis-btns">
+                  <button class="axis-btn active" data-axis="axial">Aksiyel</button>
+                  <button class="axis-btn" data-axis="sagittal">Sagittal</button>
+                  <button class="axis-btn" data-axis="coronal">Koronal</button>
+                </div>
+                <div class="viewer-slider-row">
+                  <label>DILIM</label>
+                  <input type="range" id="slice-slider" min="0" max="100" value="50">
+                  <span class="slice-readout" id="slice-readout">0/0</span>
+                </div>
+              </div>
+              <div class="viewer-legend">
+                <div class="legend-item"><div class="legend-swatch whole"></div>Whole</div>
+                <div class="legend-item"><div class="legend-swatch core"></div>Core</div>
+                <div class="legend-item"><div class="legend-swatch enh"></div>Enhancing</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- AI Assessment -->
+      <div class="card">
+        <div class="section-head">
+          <div class="section-title">YAPAY ZEKA DEGERLENDIRMESI</div>
+          <span class="ai-engine-badge">Claude Sonnet</span>
+        </div>
+        <div class="card-body">
+          <p class="ai-text" id="ai-text"></p>
+        </div>
+      </div>
+
+      <!-- Cohort -->
+      <div class="card">
+        <div class="section-head">
+          <div class="section-title">KOHORT ANALIZI (BENZER HASTALAR)</div>
+          <span class="section-badge">FAISS &middot; Top 10</span>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="dtable">
+            <thead>
+              <tr>
+                <th>Hasta ID</th>
+                <th>Benzerlik</th>
+                <th>Yas</th>
+                <th>KPS</th>
+                <th>MGMT</th>
+                <th>Sagkalim</th>
+                <th>Tedaviler</th>
+              </tr>
+            </thead>
+            <tbody id="cohort-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Literature -->
+      <div class="card">
+        <div class="section-head">
+          <div class="section-title">KLINIK LITERATUR OZETI</div>
+          <span class="section-badge">PubMed RAG</span>
+        </div>
+        <div class="card-body" id="lit-content"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ━━━ PAGE: RECORDS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div id="page-records" class="page">
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">HASTA KAYITLARI</div>
+        <span class="section-badge" id="patients-count">0 hasta</span>
+      </div>
+
+      <!-- Toolbar -->
+      <div style="padding:12px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border-light);flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="document.getElementById('csv-import-input').click()">CSV Import</button>
+        <button class="btn btn-green btn-sm" onclick="exportCSV()">CSV Export</button>
+        <button class="btn btn-outline btn-sm" onclick="downloadCSVTemplate()">Bos Sablon Indir</button>
+        <input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="importCSV(this)">
+        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)" id="db-info">SQLite: gbmaid.db</span>
+      </div>
+
+      <div id="patients-empty" class="empty" style="display:none">
+        <div class="empty-icon">&#128203;</div>
+        <p>Henuz hasta kaydi bulunmamaktadir. CSV dosyasi ile toplu yukleyebilirsiniz.</p>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="dtable">
+          <thead>
+            <tr>
+              <th>Hasta ID</th>
+              <th>Tarih</th>
+              <th>Yas</th>
+              <th>KPS</th>
+              <th>MGMT</th>
+              <th>IDH1</th>
+              <th>Risk</th>
+              <th>Sinif</th>
+              <th>Sagkalim</th>
+              <th>Islemler</th>
+            </tr>
+          </thead>
+          <tbody id="patients-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- CSV Import result banner -->
+    <div id="csv-result-banner" class="banner-success" style="display:none;margin-top:12px">
+      <div class="banner-left">
+        <div class="banner-check">&#10003;</div>
+        <div>
+          <div class="banner-title" id="csv-result-title">Import Tamamlandi</div>
+          <div class="banner-sub" id="csv-result-sub"></div>
+        </div>
+      </div>
+      <button class="btn btn-outline btn-sm" onclick="document.getElementById('csv-result-banner').style.display='none'">Kapat</button>
+    </div>
+  </div>
+
+  <!-- ━━━ PAGE: REPORTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div id="page-reports" class="page">
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">RAPOR GORUNTULE</div>
+      </div>
+      <div class="card-body">
+        <div class="form-group" style="max-width:400px">
+          <label class="form-label">Hasta Secin</label>
+          <select id="report-select" class="form-select" onchange="loadReport(this.value)">
+            <option value="">-- Hasta secin --</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div id="report-body">
+      <div class="empty">
+        <div class="empty-icon">&#128196;</div>
+        <p>Rapor goruntulemek icin yukaridaki listeden bir hasta secin.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ━━━ PAGE: DATABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div id="page-database" class="page">
+
+    <!-- Stats cards -->
+    <div class="kpi-row" id="db-stats-row">
+      <div class="kpi-card">
+        <div class="kpi-label">Hastalar</div>
+        <div class="kpi-value" id="db-stat-patients">-</div>
+        <div class="kpi-sub">patients tablosu</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Analizler</div>
+        <div class="kpi-value" id="db-stat-analyses">-</div>
+        <div class="kpi-sub">analyses tablosu</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Tedaviler</div>
+        <div class="kpi-value" id="db-stat-treatments">-</div>
+        <div class="kpi-sub">treatments tablosu</div>
+      </div>
+    </div>
+
+    <!-- Fill rate info -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="section-head">
+        <div class="section-title">VERITABANI DURUMU</div>
+        <span class="section-badge" id="db-size-badge">-</span>
+      </div>
+      <div class="card-body" id="db-fill-info" style="font-size:13px">Yukleniyor...</div>
+    </div>
+
+    <!-- Table selector -->
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">TABLO GORUNTULE</div>
+      </div>
+      <div style="padding:12px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border-light)">
+        <button class="btn btn-primary btn-sm db-tab-btn active" onclick="loadDBTable('patients', this)">Patients</button>
+        <button class="btn btn-outline btn-sm db-tab-btn" onclick="loadDBTable('analyses', this)">Analyses</button>
+        <button class="btn btn-outline btn-sm db-tab-btn" onclick="loadDBTable('treatments', this)">Treatments</button>
+        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)" id="db-table-info"></span>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="dtable" id="db-table">
+          <thead id="db-table-head"></thead>
+          <tbody id="db-table-body"></tbody>
+        </table>
+      </div>
+      <div style="padding:10px 20px;display:flex;align-items:center;gap:10px;border-top:1px solid var(--border-light)">
+        <button class="btn btn-outline btn-sm" id="db-prev-btn" onclick="dbPagePrev()" disabled>Onceki</button>
+        <span style="font-size:12px;color:var(--text-muted)" id="db-page-info">-</span>
+        <button class="btn btn-outline btn-sm" id="db-next-btn" onclick="dbPageNext()">Sonraki</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ━━━ PAGE: HELP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div id="page-help" class="page">
+
+    <div class="card">
+      <div class="section-head"><div class="section-title">SISTEM HAKKINDA</div></div>
+      <div class="card-body">
+        <div class="help-block">
+          <h3>GBM-AID Nedir?</h3>
+          <p>GBM-AID, Glioblastoma Multiforme (GBM) hastalarinda MR goruntuleri, klinik veriler ve molekuler/epigenetik omics profillerinden yararlanarak hekime gercek zamanli, kanita dayali karar destegi sunan entegre bir yapay zeka sistemidir.</p>
+          <p style="margin-top:8px"><strong>Bu sistem tani veya tedavi karari vermez.</strong> Yalnizca hekime nicel ve aciklanabilir karar destegi saglar.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head"><div class="section-title">KULLANIM KILAVUZU</div></div>
+      <div class="card-body">
+        <div class="help-block">
+          <h3>1. Dosya Yukleme</h3>
+          <ul>
+            <li>Analiz sekmesindeki yukleme alanina NIfTI (.nii veya .nii.gz) dosyalarini surukleyin.</li>
+            <li>Sistem dosya adlarindan T1, T1ce, T2, FLAIR ve segmentasyon maskesini otomatik tanir.</li>
+            <li>BraTS format: <code>*_t1.nii.gz</code>, <code>*_t1ce.nii.gz</code>, <code>*_t2.nii.gz</code>, <code>*_flair.nii.gz</code></li>
+          </ul>
+        </div>
+        <div class="help-block">
+          <h3>2. Klinik Parametre Girisi</h3>
+          <ul>
+            <li><strong>Yas:</strong> Hastanin tani anindaki yasi.</li>
+            <li><strong>KPS:</strong> Karnofsky Performans Skoru (0-100).</li>
+            <li><strong>MGMT:</strong> Metile / Metile Degil / Bilinmiyor.</li>
+            <li><strong>IDH1:</strong> Mutant / Wildtype / Bilinmiyor.</li>
+          </ul>
+        </div>
+        <div class="help-block">
+          <h3>3. Analiz Sonuclari</h3>
+          <ul>
+            <li><strong>Cox Risk Skoru (0-100):</strong> Cox PH modeli ile hesaplanan surekli risk degeri.</li>
+            <li><strong>12-Aylik Sinif:</strong> XGBoost ile tahmini risk kategorisi.</li>
+            <li><strong>Tumor Goruntuleme:</strong> MR kesitlerinin gorsel incelenmesi.</li>
+            <li><strong>Kohort Analizi:</strong> FAISS ile en yakin 10 hasta.</li>
+            <li><strong>Literatur:</strong> PubMed RAG ile hastaya ozel guncel ozet.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head"><div class="section-title">VERI SETLERI</div></div>
+      <div class="card-body">
+        <div class="help-block">
+          <ul>
+            <li><strong>TCGA-GBM:</strong> 260 hasta &mdash; klinik, radyomik ve omics verileri.</li>
+            <li><strong>UPenn-GBM:</strong> 611 hasta &mdash; klinik ve radyomik.</li>
+            <li><strong>LUMIERE:</strong> 91 hasta &mdash; longitudinal tumor hacim takip verileri.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head"><div class="section-title">SIKCA SORULAN SORULAR</div></div>
+      <div class="card-body">
+        <div class="help-block">
+          <h3>Sistem tani koyar mi?</h3>
+          <p>Hayir. GBM-AID yalnizca karar destek araci olarak tasarlanmistir.</p>
+        </div>
+        <div class="help-block">
+          <h3>Hangi dosya formatlari desteklenir?</h3>
+          <p>NIfTI formati (.nii ve .nii.gz). DICOM dosyalari yuklenemez; oncesinde NIfTI'ye donusturulmesi gerekir.</p>
+        </div>
+        <div class="help-block">
+          <h3>Verilerim guvenli mi?</h3>
+          <p>Yuklenen dosyalar yerel sunucuda saklanir. Dis servislere veri aktarimi yapilmaz (PubMed API sorgulari haric).</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<!-- ═══ Disclaimer ════════════════════════════════════════ -->
+<div class="disclaimer">
+  <strong>Uyari:</strong> Bu sistem klinik karar destek aracidir. Ham WGS analizi yapmamaktadir.
+  Nihai tani ve tedavi karari yetkili saglik profesyoneline aittir.
+</div>
+
+<!-- ═══ Footer ════════════════════════════════════════════ -->
+<footer class="footer">
+  GBM-AID Klinik Karar Destek Sistemi v5.0 &mdash; Glioblastoma Multiforme &mdash; SQLite DB
+</footer>
+
+<script src="/static/app.js"></script>
+
+</body>
+</html>
