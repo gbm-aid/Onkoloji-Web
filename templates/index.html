@@ -99,14 +99,25 @@
                 <div class="upload-text">Dosyalari surukleyin veya secin</div>
                 <div class="upload-hint">NIfTI &middot; DICOM &middot; NRRD &middot; MHA &middot; PNG &middot; JPG</div>
                 <div class="upload-btns">
-                  <button class="btn btn-primary" type="button" onclick="triggerFileSelect()">Dosya Sec</button>
-                  <button class="btn btn-green" type="button" onclick="openLumiereModal()">Lumiere Hasta Sec</button>
+                  <button class="btn btn-primary" type="button" onclick="triggerFileSelect()">Klasor Sec</button>
+                  <button class="btn btn-green" type="button" onclick="openPatientPicker()">Hasta Sec</button>
                 </div>
               </div>
-              <input type="file" id="file-input" multiple accept=".nii,.nii.gz,.gz,.dcm,.nrrd,.mha,.png,.jpg" style="display:none">
+              <input type="file" id="file-input" multiple webkitdirectory style="display:none">
               <div class="upload-info">
-                T1, T2, FLAIR, T1ce ve mask (whole/core/enh) dosyalari otomatik taninir.
-                Lumiere hastasi secince MR dosyalari otomatik yuklenir.
+                NIfTI klasoru secin — T1, T2, FLAIR, T1ce ve maskeler otomatik taninir.
+              </div>
+
+              <!-- Inline hasta seçici -->
+              <div id="patient-picker" style="display:none;border-top:1px solid var(--border-light);margin-top:12px;padding-top:12px">
+                <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+                  <input type="text" id="patient-search" class="form-input" placeholder="Hasta ara (orn. Patient-001)" oninput="filterPatientList()" style="flex:1;font-size:13px">
+                  <span id="patient-count" style="font-size:12px;color:var(--text-muted);white-space:nowrap"></span>
+                  <button class="btn btn-sm btn-outline" onclick="closePatientPicker()" style="padding:4px 10px">&times;</button>
+                </div>
+                <div id="patient-list" style="max-height:260px;overflow-y:auto;border:1px solid var(--border-light);border-radius:var(--radius-sm)">
+                  <div style="padding:16px;text-align:center;color:var(--text-muted);font-size:13px">Yukleniyor...</div>
+                </div>
               </div>
             </div>
           </div>
@@ -147,14 +158,14 @@
           <div class="card-body">
 
             <div class="form-group">
-              <label class="form-label">Hasta Adi / ID</label>
-              <input type="text" id="inp-pid" class="form-input" placeholder="orn. Patient-001 veya Ali Yildiz" style="max-width:480px">
+              <label class="form-label">Hasta Adi / ID <span style="color:var(--red)">*</span></label>
+              <input type="text" id="inp-pid" class="form-input" placeholder="orn. Patient-001 veya Ali Yildiz" style="max-width:480px" oninput="this.style.borderColor=''">
             </div>
 
             <div class="grid-4col">
               <div class="form-group">
-                <label class="form-label">Yas</label>
-                <input type="number" id="inp-age" class="form-input" value="58" min="0" max="120">
+                <label class="form-label">Yas <span style="color:var(--red)">*</span></label>
+                <input type="number" id="inp-age" class="form-input" value="58" min="0" max="120" oninput="this.style.borderColor=''">
               </div>
               <div class="form-group">
                 <label class="form-label">Cinsiyet</label>
@@ -208,6 +219,35 @@
                   <option value="unknown">Bilinmiyor</option>
                   <option value="mutant">Mutant</option>
                   <option value="wildtype">Wildtype</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="grid-3col" style="max-width:720px">
+              <div class="form-group">
+                <label class="form-label">Tani Tarihi</label>
+                <input type="date" id="inp-diagnosis-date" class="form-input">
+              </div>
+              <div class="form-group">
+                <label class="form-label">Tumor Lokalizasyonu</label>
+                <select id="inp-tumor-location" class="form-select">
+                  <option value="">Secin</option>
+                  <option value="frontal">Frontal Lob</option>
+                  <option value="temporal">Temporal Lob</option>
+                  <option value="parietal">Parietal Lob</option>
+                  <option value="occipital">Oksipital Lob</option>
+                  <option value="insular">Insula</option>
+                  <option value="multifocal">Multifokal</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Cerrahi Tipi</label>
+                <select id="inp-surgery-type" class="form-select">
+                  <option value="">Secin</option>
+                  <option value="GTR">GTR (Gross Total Rezeksiyon)</option>
+                  <option value="STR">STR (Subtotal Rezeksiyon)</option>
+                  <option value="biopsy">Sadece Biyopsi</option>
+                  <option value="none">Cerrahi Yok</option>
                 </select>
               </div>
             </div>
@@ -335,15 +375,26 @@
           <div class="card" style="overflow:hidden">
             <div class="section-head">
               <div class="section-title">TUMOR GORUNTULEME</div>
+              <div id="viewer-modality-btns" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center"></div>
             </div>
             <div class="viewer-container">
-              <div class="viewer-image-wrap">
-                <img id="viewer-img" src="" alt="MRI Viewer">
-                <span class="viewer-overlay-tl" id="viewer-axis-label">AXIAL Z=0</span>
-                <span class="viewer-overlay-tr" id="viewer-dim">-</span>
-                <span class="viewer-overlay-br">Overlay: autumn, &alpha;=0.5</span>
+              <div class="viewer-image-wrap" id="viewer-wrap">
+                <!-- No-file state -->
+                <div class="viewer-no-file" id="viewer-no-file">
+                  MRI dosyasi yuklenmedi
+                </div>
+                <!-- Main image -->
+                <img id="viewer-img" style="display:none;width:100%;height:100%;object-fit:contain">
+                <!-- Loading overlay -->
+                <div class="viewer-loading-overlay" id="viewer-loading" style="display:none">
+                  <div class="viewer-spin"></div>
+                </div>
+                <!-- Labels -->
+                <span class="viewer-overlay-tl" id="viewer-axis-label" style="display:none"></span>
+                <span class="viewer-overlay-tr" id="viewer-dim" style="display:none"></span>
+                <span class="viewer-overlay-bl" id="viewer-seg-info" style="display:none"></span>
               </div>
-              <div class="viewer-controls">
+              <div class="viewer-controls" id="viewer-controls" style="display:none">
                 <div class="viewer-axis-btns">
                   <button class="axis-btn active" data-axis="axial">Aksiyel</button>
                   <button class="axis-btn" data-axis="sagittal">Sagittal</button>
@@ -355,9 +406,9 @@
                   <span class="slice-readout" id="slice-readout">0/0</span>
                 </div>
               </div>
-              <div class="viewer-legend">
-                <div class="legend-item"><div class="legend-swatch whole"></div>Whole</div>
-                <div class="legend-item"><div class="legend-swatch core"></div>Core</div>
+              <div class="viewer-legend" id="viewer-legend" style="display:none">
+                <div class="legend-item"><div class="legend-swatch whole"></div>Whole Tumor</div>
+                <div class="legend-item"><div class="legend-swatch core"></div>Nekrotik Core</div>
                 <div class="legend-item"><div class="legend-swatch enh"></div>Enhancing</div>
               </div>
             </div>
@@ -425,7 +476,8 @@
         <button class="btn btn-green btn-sm" onclick="exportCSV()">CSV Export</button>
         <button class="btn btn-outline btn-sm" onclick="downloadCSVTemplate()">Bos Sablon Indir</button>
         <input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="importCSV(this)">
-        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)" id="db-info">SQLite: gbmaid.db</span>
+        <input type="text" id="patient-table-search" class="form-input" placeholder="Hasta ara..." oninput="filterPatientTable()" style="max-width:220px;margin-left:auto;font-size:12px;padding:5px 10px">
+        <span style="font-size:11px;color:var(--text-muted)" id="db-info">SQLite: gbmaid.db</span>
       </div>
 
       <div id="patients-empty" class="empty" style="display:none">
@@ -619,6 +671,163 @@
 
 </div>
 
+<!-- ═══ Treatment Modal ══════════════════════════════════ -->
+<div id="treatment-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;width:480px;max-width:95vw;padding:0;box-shadow:0 20px 60px rgba(0,0,0,0.3);border:1px solid var(--border)">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border-light)">
+      <div style="font-size:14px;font-weight:700;color:var(--text)">Tedavi Kaydi Ekle</div>
+      <button onclick="closeTreatmentModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-muted);padding:4px 8px;line-height:1">&times;</button>
+    </div>
+    <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+      <div id="tx-patient-badge" style="font-size:12px;color:var(--text-muted);font-family:var(--mono);padding:6px 10px;background:var(--bg);border-radius:4px"></div>
+      <div class="form-group">
+        <label class="form-label">Ilac / Tedavi <span style="color:var(--red)">*</span></label>
+        <select id="tx-drug" class="form-input" onchange="onTxDrugChange()">
+          <option value="">Secin</option>
+          <option value="Temozolomid (TMZ)">Temozolomid (TMZ)</option>
+          <option value="Radyoterapi 60Gy">Radyoterapi 60Gy</option>
+          <option value="Stupp Protokolu (RT+TMZ)">Stupp Protokolu (RT+TMZ)</option>
+          <option value="Bevacizumab">Bevacizumab</option>
+          <option value="Lomustine (CCNU)">Lomustine (CCNU)</option>
+          <option value="Cerrahi Rezeksiyon">Cerrahi Rezeksiyon</option>
+          <option value="Diger">Diger</option>
+        </select>
+      </div>
+      <div id="tx-drug-other-wrap" style="display:none" class="form-group">
+        <label class="form-label">Tedavi Adi</label>
+        <input type="text" id="tx-drug-other" class="form-input" placeholder="Tedavi adini yazin">
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="form-group">
+          <label class="form-label">Baslangic Tarihi <span style="color:var(--red)">*</span></label>
+          <input type="date" id="tx-start" class="form-input">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Bitis Tarihi</label>
+          <input type="date" id="tx-end" class="form-input">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Doz / Protokol</label>
+        <input type="text" id="tx-dose" class="form-input" placeholder="Orn: 150 mg/m2, 60Gy/30fr">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Tedavi Yaniti</label>
+        <select id="tx-response" class="form-input">
+          <option value="">Bilinmiyor</option>
+          <option value="complete">Tam Yanit (CR)</option>
+          <option value="partial">Parsiyel Yanit (PR)</option>
+          <option value="stable">Stabil Hastalik (SD)</option>
+          <option value="progression">Progresyon (PD)</option>
+        </select>
+      </div>
+      <div id="tx-error" style="color:var(--red);font-size:12px;display:none"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn btn-outline" onclick="closeTreatmentModal()">Iptal</button>
+        <button class="btn btn-green" onclick="saveTreatment()">Kaydet</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Edit Patient Modal ════════════════════════════════ -->
+<div id="edit-patient-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border-radius:12px;width:560px;max-width:95vw;padding:0;box-shadow:0 20px 60px rgba(0,0,0,0.3);border:1px solid var(--border);max-height:88vh;overflow-y:auto">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border-light);position:sticky;top:0;background:var(--surface);z-index:1">
+      <div style="font-size:14px;font-weight:700;color:var(--text)">Hasta Bilgilerini Duzenle</div>
+      <button onclick="closeEditPatient()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-muted);padding:4px 8px;line-height:1">&times;</button>
+    </div>
+    <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+      <div id="edit-patient-badge" style="font-size:12px;color:var(--text-muted);font-family:var(--mono);padding:6px 10px;background:var(--bg);border-radius:4px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="form-group">
+          <label class="form-label">Yas</label>
+          <input type="number" id="edit-age" class="form-input" min="0" max="120">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Cinsiyet</label>
+          <select id="edit-gender" class="form-input">
+            <option value="">Secin</option>
+            <option value="M">Erkek</option>
+            <option value="F">Kadin</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="form-group">
+          <label class="form-label">KPS Skoru</label>
+          <select id="edit-kps" class="form-input">
+            <option value="">Secin</option>
+            <option value="100">100</option>
+            <option value="90">90</option>
+            <option value="80">80</option>
+            <option value="70">70</option>
+            <option value="60">60</option>
+            <option value="50">50</option>
+            <option value="40">40</option>
+            <option value="30">30</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Tani Tarihi</label>
+          <input type="date" id="edit-diagnosis-date" class="form-input">
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="form-group">
+          <label class="form-label">Tumor Lokalizasyonu</label>
+          <select id="edit-tumor-location" class="form-input">
+            <option value="">Secin</option>
+            <option value="frontal">Frontal Lob</option>
+            <option value="temporal">Temporal Lob</option>
+            <option value="parietal">Parietal Lob</option>
+            <option value="occipital">Oksipital Lob</option>
+            <option value="insular">Insula</option>
+            <option value="multifocal">Multifokal</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Cerrahi Tipi</label>
+          <select id="edit-surgery-type" class="form-input">
+            <option value="">Secin</option>
+            <option value="GTR">GTR (Gross Total Rezeksiyon)</option>
+            <option value="STR">STR (Subtotal Rezeksiyon)</option>
+            <option value="biopsy">Sadece Biyopsi</option>
+            <option value="none">Cerrahi Yok</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div class="form-group">
+          <label class="form-label">MGMT</label>
+          <select id="edit-mgmt" class="form-input">
+            <option value="unknown">Bilinmiyor</option>
+            <option value="methylated">Metile</option>
+            <option value="unmethylated">Metile Degil</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">IDH1</label>
+          <select id="edit-idh1" class="form-input">
+            <option value="unknown">Bilinmiyor</option>
+            <option value="mutant">Mutant</option>
+            <option value="wildtype">Wildtype</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Notlar</label>
+        <input type="text" id="edit-notes" class="form-input" placeholder="Klinik notlar...">
+      </div>
+      <div id="edit-error" style="color:var(--red);font-size:12px;display:none"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="btn btn-outline" onclick="closeEditPatient()">Iptal</button>
+        <button class="btn btn-green" onclick="saveEditPatient()">Kaydet</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ═══ Disclaimer ════════════════════════════════════════ -->
 <div class="disclaimer">
   <strong>Uyari:</strong> Bu sistem klinik karar destek aracidir. Ham WGS analizi yapmamaktadir.
@@ -630,20 +839,6 @@
   GBM-AID Klinik Karar Destek Sistemi v5.0 &mdash; Glioblastoma Multiforme &mdash; SQLite DB
 </footer>
 
-<!-- Lumiere Patient Modal -->
-<div id="lumiere-modal" class="modal-overlay" style="display:none">
-  <div class="modal-box">
-    <div class="modal-header">
-      <div class="section-title">LUMIERE HASTA SEC</div>
-      <button class="modal-close" onclick="closeLumiereModal()">&times;</button>
-    </div>
-    <div style="padding:12px 20px;border-bottom:1px solid var(--border-light);display:flex;gap:10px;align-items:center">
-      <input type="text" id="lumiere-search" class="form-input" placeholder="Hasta ara (orn. Patient-001)" style="flex:1" oninput="filterLumiereList()">
-      <span id="lumiere-count" style="font-size:12px;color:var(--text-muted)">0 hasta</span>
-    </div>
-    <div id="lumiere-list" class="modal-list"></div>
-  </div>
-</div>
 
 <script src="/static/app.js"></script>
 

@@ -774,6 +774,76 @@ body {
   color: rgba(255,255,255,0.35);
 }
 
+.viewer-overlay-bl {
+  position: absolute;
+  bottom: 10px; left: 12px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: rgba(255,255,255,0.35);
+  max-width: 70%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewer-no-file {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 200px;
+  color: rgba(255,255,255,0.25);
+  font-size: 13px;
+  font-family: var(--mono);
+  letter-spacing: 0.5px;
+}
+
+.viewer-loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8,8,16,0.5);
+  z-index: 5;
+}
+
+.viewer-spin {
+  width: 28px; height: 28px;
+  border: 2px solid rgba(255,255,255,0.12);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* Modality selector buttons (inside viewer header) */
+.vmod-btn {
+  padding: 3px 12px;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 4px;
+  background: transparent;
+  color: rgba(255,255,255,0.45);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.vmod-btn:hover {
+  border-color: rgba(255,255,255,0.35);
+  color: rgba(255,255,255,0.8);
+}
+
+.vmod-btn.vmod-active {
+  background: var(--navy-light);
+  border-color: var(--blue);
+  color: #fff;
+}
+
 .viewer-controls {
   padding: 10px 14px;
   background: #12121e;
@@ -1119,6 +1189,62 @@ body {
 .tl-date { font-size: 11px; color: var(--text-muted); margin-bottom: 3px; }
 .tl-risk { font-size: 14px; font-weight: 700; margin-bottom: 2px; }
 .tl-detail { font-size: 11px; color: var(--text-secondary); }
+
+/* ── Field validation ─────────────────────────────────────── */
+
+.field-error {
+  color: var(--red);
+  font-size: 11px;
+  margin-top: 3px;
+  display: block;
+}
+
+.form-input.input-error,
+.form-select.input-error {
+  border-color: var(--red) !important;
+  box-shadow: 0 0 0 3px rgba(192,57,43,0.1);
+}
+
+/* ── Risk factor attribution bars ────────────────────────────── */
+
+.risk-attr-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.risk-attr-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 150px;
+  flex-shrink: 0;
+}
+
+.risk-attr-bar-wrap {
+  flex: 1;
+  height: 8px;
+  background: var(--border-light);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.risk-attr-bar {
+  height: 100%;
+  border-radius: 4px;
+  min-width: 4px;
+  transition: width 0.5s ease;
+}
+
+.risk-attr-val {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  min-width: 70px;
+  text-align: right;
+  flex-shrink: 0;
+}
 
 /* ── Print / PDF ────────────────────────────────────────────── */
 

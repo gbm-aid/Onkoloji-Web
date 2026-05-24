@@ -13,6 +13,9 @@ let state = {
   viewerSlice: 0,
   viewerMaxSlice: 0,
 };
+let _allPatients = [];
+let _txPatientId = '';
+let _editPatientId = '';
 
 /* ── Init ─────────────────────────────────────────────────── */
 
@@ -101,9 +104,17 @@ function triggerFileSelect() {
 }
 
 async function handleUpload(fileList) {
-  showLoader('Dosyalar yukleniyor...');
+  // Sadece NIfTI dosyalarini yukle
+  const nifti = Array.from(fileList).filter(f =>
+    f.name.endsWith('.nii') || f.name.endsWith('.nii.gz')
+  );
+  if (!nifti.length) {
+    alert('Klasorde NIfTI dosyasi bulunamadi (.nii veya .nii.gz).');
+    return;
+  }
+  showLoader(`${nifti.length} NIfTI dosyasi yukleniyor...`);
   const form = new FormData();
-  for (const f of fileList) form.append('files', f);
+  for (const f of nifti) form.append('files', f);
   try {
     const res = await fetch(API + '/api/upload', { method: 'POST', body: form });
     const data = await res.json();
@@ -179,48 +190,52 @@ function showClinicalForm() {
   setStep(3);
 }
 
-/* ── Lumiere Patient Selection ────────────────────────────── */
+/* ── Inline Hasta Seçici ──────────────────────────────────── */
 
-let lumiereData = [];
+let _pickerData = [];
+let _pickerLoaded = false;
 
-async function openLumiereModal() {
-  const modal = document.getElementById('lumiere-modal');
-  if (!modal) return;
-  modal.style.display = 'flex';
-  showLoader('Lumiere hastalari yukleniyor...');
+function openPatientPicker() {
+  const picker = document.getElementById('patient-picker');
+  if (!picker) return;
+  picker.style.display = 'block';
+  if (!_pickerLoaded) _loadPickerPatients();
+}
+
+function closePatientPicker() {
+  const picker = document.getElementById('patient-picker');
+  if (picker) picker.style.display = 'none';
+}
+
+async function _loadPickerPatients() {
+  _pickerLoaded = true;
   try {
     const res = await fetch(API + '/api/lumiere-patients');
     const data = await res.json();
-    lumiereData = data.patients || [];
-    document.getElementById('lumiere-count').textContent = lumiereData.length + ' hasta';
-    renderLumiereList(lumiereData);
+    _pickerData = data.patients || [];
+    const cnt = document.getElementById('patient-count');
+    if (cnt) cnt.textContent = _pickerData.length + ' hasta';
+    renderPatientList(_pickerData);
   } catch (err) {
-    document.getElementById('lumiere-list').innerHTML = '<div style="padding:20px;color:var(--red)">Yuklenemedi: ' + err.message + '</div>';
-  } finally {
-    hideLoader();
+    const el = document.getElementById('patient-list');
+    if (el) el.innerHTML = `<div style="padding:16px;color:var(--red);font-size:13px">Yuklenemedi: ${esc(err.message)}</div>`;
   }
 }
 
-function closeLumiereModal() {
-  const modal = document.getElementById('lumiere-modal');
-  if (modal) modal.style.display = 'none';
+function filterPatientList() {
+  const q = (document.getElementById('patient-search')?.value || '').toLowerCase();
+  renderPatientList(_pickerData.filter(p => p.patient_id.toLowerCase().includes(q)));
 }
 
-function filterLumiereList() {
-  const q = (document.getElementById('lumiere-search')?.value || '').toLowerCase();
-  const filtered = lumiereData.filter(p => p.patient_id.toLowerCase().includes(q));
-  renderLumiereList(filtered);
-}
-
-function renderLumiereList(patients) {
-  const el = document.getElementById('lumiere-list');
+function renderPatientList(patients) {
+  const el = document.getElementById('patient-list');
   if (!el) return;
   if (!patients.length) {
-    el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted)">Hasta bulunamadi</div>';
+    el.innerHTML = '<div style="padding:16px;text-align:center;color:var(--text-muted);font-size:13px">Hasta bulunamadi</div>';
     return;
   }
   el.innerHTML = patients.map(p => `
-    <div class="lum-item" onclick="selectLumierePatient('${esc(p.patient_id)}','${esc(p.default_timepoint)}')">
+    <div class="lum-item" onclick="selectLumierePatient('${esc(p.patient_id)}','${esc(p.default_timepoint)}');closePatientPicker()">
       <span class="lum-pid">${esc(p.patient_id)}</span>
       <span class="lum-info">${p.timepoints.length} zaman noktasi</span>
       <span class="lum-badge">${p.mri_count}/4 MR</span>
@@ -229,7 +244,7 @@ function renderLumiereList(patients) {
 }
 
 async function selectLumierePatient(patientId, defaultTp) {
-  closeLumiereModal();
+  closePatientPicker();
   showLoader('MR dosyalari yukleniyor...');
   try {
     const res = await fetch(API + '/api/lumiere-files/' + encodeURIComponent(patientId) + '?timepoint=' + encodeURIComponent(defaultTp));
@@ -275,13 +290,31 @@ async function selectLumierePatient(patientId, defaultTp) {
 /* ── Analysis ─────────────────────────────────────────────── */
 
 async function runAnalysis() {
-  const pid = document.getElementById('inp-pid')?.value.trim() || undefined;
-  const age = parseInt(document.getElementById('inp-age')?.value) || 60;
+  const pidEl = document.getElementById('inp-pid');
+  const ageEl = document.getElementById('inp-age');
+  const pid = pidEl?.value.trim();
+  const age = parseInt(ageEl?.value) || 0;
+
+  // Client-side validation
+  if (!pid) {
+    if (pidEl) { pidEl.classList.add('input-error'); pidEl.focus(); }
+    alert('Hasta adi / ID zorunludur.');
+    return;
+  }
+  if (!age || age < 0 || age > 120) {
+    if (ageEl) { ageEl.classList.add('input-error'); ageEl.focus(); }
+    alert('Gecerli bir yas girin (0-120).');
+    return;
+  }
+
   const gender = document.getElementById('inp-gender')?.value || 'unknown';
   const kps = parseInt(document.getElementById('inp-kps')?.value) || 70;
   const treatment = document.getElementById('inp-treatment')?.value || 'stupp';
   const mgmt = document.getElementById('inp-mgmt')?.value || 'unknown';
   const idh1 = document.getElementById('inp-idh1')?.value || 'unknown';
+  const diagnosisDate = document.getElementById('inp-diagnosis-date')?.value || null;
+  const tumorLocation = document.getElementById('inp-tumor-location')?.value || null;
+  const surgeryType = document.getElementById('inp-surgery-type')?.value || null;
 
   setStep(4);
   showLoader('Analiz calistiriliyor...');
@@ -293,7 +326,13 @@ async function runAnalysis() {
       body: JSON.stringify({
         patient_id: pid,
         session_id: state.sessionId,
-        clinical: { age, gender, kps_score: kps, treatment, mgmt_status: mgmt, idh1_status: idh1 },
+        clinical: {
+          age, gender, kps_score: kps, treatment,
+          mgmt_status: mgmt, idh1_status: idh1,
+          diagnosis_date: diagnosisDate,
+          tumor_location: tumorLocation,
+          surgery_type: surgeryType,
+        },
         files: state.files,
       }),
     });
@@ -347,7 +386,7 @@ function showResults(data) {
   document.getElementById('vol-enh').textContent = r.radiomics.enhancing_volume_cm3.toFixed(1);
 
   // Viewer
-  setupViewer();
+  Viewer.init(state.sessionId, state.files);
 
   // AI summary
   document.getElementById('ai-text').textContent = r.ai_summary;
@@ -362,77 +401,177 @@ function showResults(data) {
   renderProjection(r.projection, r.radiomics.tumor_volume_cm3);
 }
 
-/* ── MRI Viewer ───────────────────────────────────────────── */
+/* ── MRI Viewer (yeniden yazıldı) ─────────────────────────── */
 
-function setupViewer() {
-  const imgFiles = state.files.filter(f => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(f.modality));
-  const segFiles = state.files.filter(f => f.modality.startsWith('MASK') || f.modality === 'SEG');
-  const mainFile = imgFiles.find(f => f.modality === 'T1ce') || imgFiles.find(f => f.modality === 'FLAIR') || imgFiles[0];
+const Viewer = {
+  sessionId: '',
+  imgFiles: [],
+  segFiles: [],
+  activeFile: null,
+  axis: 'axial',
+  slice: 0,
+  maxSlices: { axial: 0, coronal: 0, sagittal: 0 },
+  _timer: null,
 
-  if (!mainFile) {
-    document.getElementById('viewer-img').alt = 'Goruntu bulunamadi';
-    return;
-  }
+  init(sessionId, files) {
+    this.sessionId = sessionId;
+    this.imgFiles = files.filter(f => ['T1', 'T1ce', 'T2', 'FLAIR'].includes(f.modality));
+    this.segFiles = files.filter(f => f.modality.startsWith('MASK') || f.modality === 'SEG');
+    this.activeFile = this.imgFiles.find(f => f.modality === 'T1ce')
+                   || this.imgFiles.find(f => f.modality === 'FLAIR')
+                   || this.imgFiles[0] || null;
+    this.axis = 'axial';
 
-  const shape = mainFile.shape || [155, 240, 240];
-  const axisMax = { axial: shape[2] - 1, coronal: shape[1] - 1, sagittal: shape[0] - 1 };
-  state.viewerMaxSlice = axisMax[state.viewerAxis] || 0;
-  state.viewerSlice = Math.floor(state.viewerMaxSlice / 2);
+    if (!this.activeFile) {
+      this._showNoFile();
+      return;
+    }
 
-  const slider = document.getElementById('slice-slider');
-  if (slider) {
-    slider.max = state.viewerMaxSlice;
-    slider.value = state.viewerSlice;
-  }
+    const shape = this.activeFile.shape || [155, 240, 240];
+    this.maxSlices = {
+      axial:    Math.max(0, shape[2] - 1),
+      coronal:  Math.max(0, shape[1] - 1),
+      sagittal: Math.max(0, shape[0] - 1),
+    };
+    this.slice = Math.floor(this.maxSlices.axial / 2);
 
-  const dimEl = document.getElementById('viewer-dim');
-  if (dimEl) dimEl.textContent = shape.join('x');
+    this._showViewerUI();
+    this._renderModalityBtns();
+    this._syncAxisUI();
+    this._bindEvents();
+    this._updateDimLabel(shape);
+    this._updateSegLabel();
+    this.loadSlice();
+  },
 
-  updateViewerImage(mainFile, segFiles);
-  updateSliceReadout();
+  _showNoFile() {
+    document.getElementById('viewer-no-file').style.display = 'flex';
+    document.getElementById('viewer-img').style.display = 'none';
+    document.getElementById('viewer-controls').style.display = 'none';
+    document.getElementById('viewer-legend').style.display = 'none';
+    document.getElementById('viewer-axis-label').style.display = 'none';
+    document.getElementById('viewer-dim').style.display = 'none';
+    document.getElementById('viewer-modality-btns').innerHTML = '';
+  },
 
-  // Axis buttons
-  document.querySelectorAll('.axis-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.axis-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.viewerAxis = btn.dataset.axis;
-      const newMax = axisMax[state.viewerAxis] || 0;
-      state.viewerMaxSlice = newMax;
-      state.viewerSlice = Math.floor(newMax / 2);
-      if (slider) { slider.max = newMax; slider.value = state.viewerSlice; }
-      updateViewerImage(mainFile, segFiles);
-      updateSliceReadout();
+  _showViewerUI() {
+    document.getElementById('viewer-no-file').style.display = 'none';
+    document.getElementById('viewer-img').style.display = 'block';
+    document.getElementById('viewer-controls').style.display = 'block';
+    document.getElementById('viewer-axis-label').style.display = 'block';
+    document.getElementById('viewer-dim').style.display = 'block';
+    if (this.segFiles.length) {
+      document.getElementById('viewer-legend').style.display = 'flex';
+      document.getElementById('viewer-seg-info').style.display = 'block';
+    } else {
+      document.getElementById('viewer-legend').style.display = 'none';
+      document.getElementById('viewer-seg-info').style.display = 'none';
+    }
+  },
+
+  _renderModalityBtns() {
+    const el = document.getElementById('viewer-modality-btns');
+    if (!el) return;
+    el.innerHTML = this.imgFiles.map(f => {
+      const active = f.filename === this.activeFile?.filename ? 'vmod-active' : '';
+      return `<button class="vmod-btn ${active}" onclick="Viewer.switchModality('${esc(f.filename)}')">${esc(f.modality)}</button>`;
+    }).join('');
+  },
+
+  _syncAxisUI() {
+    document.querySelectorAll('.axis-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.axis === this.axis);
     });
-  });
+    const slider = document.getElementById('slice-slider');
+    if (slider) {
+      slider.min = 0;
+      slider.max = this.maxSlices[this.axis];
+      slider.value = this.slice;
+    }
+    this._updateLabels();
+  },
 
-  // Slice slider
-  if (slider) {
-    slider.addEventListener('input', () => {
-      state.viewerSlice = parseInt(slider.value);
-      updateViewerImage(mainFile, segFiles);
-      updateSliceReadout();
+  _bindEvents() {
+    // .onclick yerine addEventListener KULLANILMIYOR — yığılmayı önler
+    document.querySelectorAll('.axis-btn').forEach(btn => {
+      btn.onclick = () => {
+        this.axis = btn.dataset.axis;
+        this.slice = Math.floor(this.maxSlices[this.axis] / 2);
+        this._syncAxisUI();
+        this.loadSlice();
+      };
     });
-  }
-}
+    const slider = document.getElementById('slice-slider');
+    if (slider) {
+      slider.oninput = () => {
+        this.slice = parseInt(slider.value);
+        this._updateLabels();
+        this._debounce();
+      };
+    }
+  },
 
-function updateViewerImage(mainFile, segFiles) {
-  const img = document.getElementById('viewer-img');
-  if (!img) return;
-  let url = `${API}/api/slice/${encodeURIComponent(state.sessionId)}/${encodeURIComponent(mainFile.filename)}?axis=${state.viewerAxis}&index=${state.viewerSlice}`;
-  if (segFiles.length) {
-    url += '&overlays=' + segFiles.map(f => encodeURIComponent(f.filename)).join(',');
-  }
-  img.src = url;
-  const label = document.getElementById('viewer-axis-label');
-  const axisLabels = { axial: 'AXIAL', coronal: 'CORONAL', sagittal: 'SAGITTAL' };
-  if (label) label.textContent = (axisLabels[state.viewerAxis] || 'AXIAL') + ' Z=' + state.viewerSlice;
-}
+  _debounce() {
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = setTimeout(() => this.loadSlice(), 80);
+  },
 
-function updateSliceReadout() {
-  const el = document.getElementById('slice-readout');
-  if (el) el.textContent = state.viewerSlice + '/' + state.viewerMaxSlice;
-}
+  loadSlice() {
+    if (!this.activeFile) return;
+    const img = document.getElementById('viewer-img');
+    const spinner = document.getElementById('viewer-loading');
+    if (!img) return;
+
+    if (spinner) spinner.style.display = 'flex';
+    img.style.opacity = '0.35';
+
+    let url = `${API}/api/slice/${encodeURIComponent(this.sessionId)}/${encodeURIComponent(this.activeFile.filename)}?axis=${this.axis}&index=${this.slice}`;
+    if (this.segFiles.length) {
+      url += '&overlays=' + this.segFiles.map(f => encodeURIComponent(f.filename)).join(',');
+    }
+
+    const tmp = new Image();
+    tmp.onload = () => {
+      img.src = tmp.src;
+      img.style.opacity = '1';
+      if (spinner) spinner.style.display = 'none';
+    };
+    tmp.onerror = () => {
+      img.style.opacity = '0.15';
+      if (spinner) spinner.style.display = 'none';
+    };
+    tmp.src = url;
+  },
+
+  switchModality(filename) {
+    const f = this.imgFiles.find(f => f.filename === filename);
+    if (!f) return;
+    this.activeFile = f;
+    this._renderModalityBtns();
+    this.loadSlice();
+  },
+
+  _updateLabels() {
+    const ax = { axial: 'AX', coronal: 'COR', sagittal: 'SAG' };
+    const label = document.getElementById('viewer-axis-label');
+    const readout = document.getElementById('slice-readout');
+    if (label) label.textContent = `${ax[this.axis] || 'AX'} ${this.slice} / ${this.maxSlices[this.axis]}`;
+    if (readout) readout.textContent = `${this.slice} / ${this.maxSlices[this.axis]}`;
+  },
+
+  _updateDimLabel(shape) {
+    const el = document.getElementById('viewer-dim');
+    if (el) el.textContent = shape.join(' × ');
+  },
+
+  _updateSegLabel() {
+    const el = document.getElementById('viewer-seg-info');
+    if (!el) return;
+    if (this.segFiles.length) {
+      el.textContent = `SEG: ${this.segFiles.map(f => f.filename.replace('.nii.gz','').replace('.nii','')).join(', ')}`;
+    }
+  },
+};
 
 /* ── Cohort ───────────────────────────────────────────────── */
 
@@ -512,10 +651,19 @@ async function loadPatients() {
   try {
     const res = await fetch(API + '/api/patients');
     const data = await res.json();
+    _allPatients = data.patients || [];
     const count = document.getElementById('patients-count');
-    if (count) count.textContent = (data.patients || []).length + ' hasta';
-    renderPatientTable(data.patients);
+    if (count) count.textContent = _allPatients.length + ' hasta';
+    renderPatientTable(_allPatients);
   } catch (err) { console.error(err); }
+}
+
+function filterPatientTable() {
+  const q = (document.getElementById('patient-table-search')?.value || '').toLowerCase().trim();
+  const filtered = q
+    ? _allPatients.filter(p => p.patient_id.toLowerCase().includes(q))
+    : _allPatients;
+  renderPatientTable(filtered);
 }
 
 function renderPatientTable(patients) {
@@ -541,8 +689,10 @@ function renderPatientTable(patients) {
       <td>${p.risk_score != null ? p.risk_score.toFixed(0) : '-'}</td>
       <td>${p.risk_class ? `<span class="risk-badge ${p.risk_class}">${p.risk_label}</span>` : '-'}</td>
       <td>${p.survival_6m != null ? '%' + p.survival_6m.toFixed(0) : '-'}</td>
-      <td>
-        <button class="btn btn-sm btn-outline" onclick="viewPatientReport('${esc(p.patient_id)}')">Detay</button>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-outline" onclick="viewPatientReport('${esc(p.patient_id)}')">Rapor</button>
+        <button class="btn btn-sm btn-outline" onclick="openEditPatient('${esc(p.patient_id)}')">Duzenle</button>
+        <button class="btn btn-sm btn-green" onclick="openTreatmentModal('${esc(p.patient_id)}')">+ Tedavi</button>
         <button class="btn btn-sm btn-danger-outline" onclick="deletePatient('${esc(p.patient_id)}')">Sil</button>
       </td>
     </tr>
@@ -589,6 +739,11 @@ async function loadReport(pid) {
     const r = d.results || {};
     const rad = r.radiomics || {};
 
+    const locLabels = { frontal:'Frontal Lob', temporal:'Temporal Lob', parietal:'Parietal Lob',
+      occipital:'Oksipital Lob', insular:'Insula', multifocal:'Multifokal' };
+    const surgLabels = { GTR:'GTR (Gross Total Rezeksiyon)', STR:'STR (Subtotal Rezeksiyon)',
+      biopsy:'Sadece Biyopsi', none:'Cerrahi Yok' };
+
     el.innerHTML = `
       <div class="banner-success" style="margin-top:12px">
         <div class="banner-left">
@@ -602,15 +757,22 @@ async function loadReport(pid) {
       </div>
 
       <div class="grid-2col">
-        <div class="card"><div class="section-head"><div class="section-title">Klinik Bilgiler</div></div>
+        <div class="card">
+          <div class="section-head">
+            <div class="section-title">Klinik Bilgiler</div>
+            <button class="btn btn-sm btn-outline" onclick="openEditPatient('${esc(d.patient_id)}')">Duzenle</button>
+          </div>
           <div class="card-body">
             <table style="width:100%;font-size:13px">
-              <tr><td style="color:var(--text-muted);padding:5px 0;width:140px">Yas</td><td style="font-weight:600">${c.age || '-'}</td></tr>
-              <tr><td style="color:var(--text-muted);padding:5px 0">Cinsiyet</td><td style="font-weight:600">${c.gender || '-'}</td></tr>
+              <tr><td style="color:var(--text-muted);padding:5px 0;width:150px">Yas</td><td style="font-weight:600">${c.age || '-'}</td></tr>
+              <tr><td style="color:var(--text-muted);padding:5px 0">Cinsiyet</td><td style="font-weight:600">${c.gender === 'M' ? 'Erkek' : c.gender === 'F' ? 'Kadin' : (c.gender || '-')}</td></tr>
               <tr><td style="color:var(--text-muted);padding:5px 0">KPS Skoru</td><td style="font-weight:600">${c.kps_score || '-'}</td></tr>
               <tr><td style="color:var(--text-muted);padding:5px 0">MGMT</td><td style="font-weight:600">${c.mgmt_status || '-'}</td></tr>
               <tr><td style="color:var(--text-muted);padding:5px 0">IDH1</td><td style="font-weight:600">${c.idh1_status || '-'}</td></tr>
-              <tr><td style="color:var(--text-muted);padding:5px 0">Tedavi</td><td style="font-weight:600">${c.treatment || '-'}</td></tr>
+              <tr><td style="color:var(--text-muted);padding:5px 0">Tedavi Protokolu</td><td style="font-weight:600">${c.treatment || '-'}</td></tr>
+              ${c.diagnosis_date ? `<tr><td style="color:var(--text-muted);padding:5px 0">Tani Tarihi</td><td style="font-weight:600">${esc(c.diagnosis_date)}</td></tr>` : ''}
+              ${c.tumor_location ? `<tr><td style="color:var(--text-muted);padding:5px 0">Tumor Lokalizasyonu</td><td style="font-weight:600">${esc(locLabels[c.tumor_location] || c.tumor_location)}</td></tr>` : ''}
+              ${c.surgery_type ? `<tr><td style="color:var(--text-muted);padding:5px 0">Cerrahi Tipi</td><td style="font-weight:600">${esc(surgLabels[c.surgery_type] || c.surgery_type)}</td></tr>` : ''}
             </table>
           </div>
         </div>
@@ -633,27 +795,33 @@ async function loadReport(pid) {
         <div class="card-body"><p class="ai-text">${esc(r.ai_summary)}</p></div>
       </div>` : ''}
 
-      ${d.treatments && d.treatments.length ? `
-      <div class="card"><div class="section-head"><div class="section-title">Tedaviler</div></div>
+      ${renderRiskFactors(r.risk_factors)}
+
+      <div class="card">
+        <div class="section-head">
+          <div class="section-title">Tedaviler</div>
+          <button class="btn btn-sm btn-green" onclick="openTreatmentModal('${esc(d.patient_id)}')">+ Tedavi Ekle</button>
+        </div>
         <div class="card-body">
+          ${d.treatments && d.treatments.length ? `
           <table style="width:100%;font-size:13px;border-collapse:collapse">
             <thead><tr style="border-bottom:2px solid var(--border)">
               <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Ilac / Tedavi</th>
-              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Protokol</th>
-              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Siklus</th>
-              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Not</th>
+              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Baslangic</th>
+              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Doz</th>
+              <th style="text-align:left;padding:6px 8px;color:var(--text-muted)">Yanit</th>
             </tr></thead>
             <tbody>
               ${d.treatments.map(t => `<tr style="border-bottom:1px solid var(--border)">
                 <td style="padding:6px 8px;font-weight:600">${esc(t.drug_name)}</td>
-                <td style="padding:6px 8px">${esc(t.protocol || '-')}</td>
-                <td style="padding:6px 8px">${t.cycles || '-'}</td>
-                <td style="padding:6px 8px;font-size:12px;color:var(--text-muted)">${esc(t.notes || '')}</td>
+                <td style="padding:6px 8px;font-size:12px">${t.start_date ? esc(t.start_date) : '-'}</td>
+                <td style="padding:6px 8px;font-size:12px;color:var(--text-muted)">${esc(t.dosage || '-')}</td>
+                <td style="padding:6px 8px">${t.response ? `<span class="risk-badge" style="background:var(--blue-pale);color:var(--navy)">${esc(t.response)}</span>` : '-'}</td>
               </tr>`).join('')}
             </tbody>
-          </table>
+          </table>` : `<p style="color:var(--text-muted);font-size:13px">Henuz tedavi kaydi bulunmamaktadir.</p>`}
         </div>
-      </div>` : ''}
+      </div>
 
       <div id="report-timeline-container"></div>
       <div id="report-viewer-container"></div>
@@ -822,9 +990,10 @@ function resetAnalysis() {
   if (fc) fc.textContent = '0 dosya';
 
   // Reset form
-  ['inp-pid','inp-age','inp-gender','inp-kps','inp-treatment','inp-mgmt','inp-idh1'].forEach(id => {
+  ['inp-pid','inp-age','inp-gender','inp-kps','inp-treatment','inp-mgmt','inp-idh1',
+   'inp-diagnosis-date','inp-tumor-location','inp-surgery-type'].forEach(id => {
     const el = document.getElementById(id);
-    if (el) el.value = el.defaultValue || '';
+    if (el) { el.value = el.defaultValue || ''; el.classList.remove('input-error'); el.style.borderColor = ''; }
   });
 }
 
@@ -953,6 +1122,170 @@ function renderStatBars(containerId, data, colorMap, labelMap) {
         </div>
       </div>`;
   }).join('');
+}
+
+/* ── Risk Faktör Atfı ────────────────────────────────────── */
+
+function renderRiskFactors(factors) {
+  if (!factors || !factors.length) return '';
+  const items = factors.map(f => ({
+    label: f.factor || f.label || f.name || 'Faktor',
+    value: f.value != null ? f.value : '',
+    impact: Math.abs(f.impact || f.weight || f.delta_risk || 0),
+    direction: f.direction || ((f.impact || f.weight || 0) > 0 ? 'high' : 'low'),
+  }));
+  const maxImpact = Math.max(...items.map(i => i.impact), 0.001);
+  return `
+    <div class="card">
+      <div class="section-head"><div class="section-title">RISK FAKTOR ATFI</div></div>
+      <div class="card-body">
+        ${items.map(item => {
+          const pct = Math.round(item.impact / maxImpact * 100);
+          const color = item.direction === 'high' ? 'var(--red)' : item.direction === 'low' ? 'var(--green)' : 'var(--blue)';
+          return `<div class="risk-attr-row">
+            <span class="risk-attr-label">${esc(item.label)}</span>
+            <div class="risk-attr-bar-wrap"><div class="risk-attr-bar" style="width:${pct}%;background:${color}"></div></div>
+            <span class="risk-attr-val">${esc(String(item.value))}</span>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+}
+
+/* ── Tedavi Modal ─────────────────────────────────────────── */
+
+function openTreatmentModal(pid) {
+  _txPatientId = pid;
+  const badge = document.getElementById('tx-patient-badge');
+  if (badge) badge.textContent = 'Hasta: ' + pid;
+  ['tx-drug','tx-start','tx-end','tx-dose','tx-response'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  const errEl = document.getElementById('tx-error');
+  if (errEl) errEl.style.display = 'none';
+  const otherWrap = document.getElementById('tx-drug-other-wrap');
+  if (otherWrap) otherWrap.style.display = 'none';
+  const modal = document.getElementById('treatment-modal');
+  if (modal) modal.style.display = 'flex';
+}
+
+function closeTreatmentModal() {
+  const modal = document.getElementById('treatment-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function onTxDrugChange() {
+  const val = document.getElementById('tx-drug')?.value;
+  const wrap = document.getElementById('tx-drug-other-wrap');
+  if (wrap) wrap.style.display = val === 'Diger' ? 'block' : 'none';
+}
+
+async function saveTreatment() {
+  const drugSelect = document.getElementById('tx-drug')?.value;
+  const drugOther = document.getElementById('tx-drug-other')?.value.trim();
+  const drugName = drugSelect === 'Diger' ? drugOther : drugSelect;
+  const startDate = document.getElementById('tx-start')?.value;
+  const errEl = document.getElementById('tx-error');
+
+  if (!drugName) {
+    if (errEl) { errEl.textContent = 'Tedavi adi zorunludur.'; errEl.style.display = 'block'; }
+    return;
+  }
+  if (!startDate) {
+    if (errEl) { errEl.textContent = 'Baslangic tarihi zorunludur.'; errEl.style.display = 'block'; }
+    return;
+  }
+  if (errEl) errEl.style.display = 'none';
+
+  const body = {
+    drug_name: drugName,
+    start_date: startDate,
+    end_date: document.getElementById('tx-end')?.value || null,
+    dosage: document.getElementById('tx-dose')?.value.trim() || null,
+    response: document.getElementById('tx-response')?.value || null,
+  };
+
+  try {
+    const res = await fetch(API + '/api/patients/' + encodeURIComponent(_txPatientId) + '/treatments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('Sunucu hatasi: ' + res.status);
+    closeTreatmentModal();
+    // Refresh report if currently viewing this patient
+    const sel = document.getElementById('report-select');
+    if (sel && sel.value === _txPatientId) loadReport(_txPatientId);
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+  }
+}
+
+/* ── Hasta Düzenleme Modal ────────────────────────────────── */
+
+async function openEditPatient(pid) {
+  _editPatientId = pid;
+  try {
+    const res = await fetch(API + '/api/patients/' + encodeURIComponent(pid));
+    const d = await res.json();
+    const c = d.clinical || {};
+    const badge = document.getElementById('edit-patient-badge');
+    if (badge) badge.textContent = 'Hasta: ' + pid;
+    const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val || ''; };
+    setVal('edit-age', c.age);
+    setVal('edit-gender', c.gender);
+    setVal('edit-kps', c.kps_score);
+    setVal('edit-diagnosis-date', c.diagnosis_date);
+    setVal('edit-tumor-location', c.tumor_location);
+    setVal('edit-surgery-type', c.surgery_type);
+    setVal('edit-mgmt', c.mgmt_status || 'unknown');
+    setVal('edit-idh1', c.idh1_status || 'unknown');
+    setVal('edit-notes', d.notes);
+    const errEl = document.getElementById('edit-error');
+    if (errEl) errEl.style.display = 'none';
+    const modal = document.getElementById('edit-patient-modal');
+    if (modal) modal.style.display = 'flex';
+  } catch (err) {
+    alert('Hasta bilgileri yuklenemedi: ' + err.message);
+  }
+}
+
+function closeEditPatient() {
+  const modal = document.getElementById('edit-patient-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function saveEditPatient() {
+  const errEl = document.getElementById('edit-error');
+  const getVal = id => document.getElementById(id)?.value;
+  const body = {
+    age: getVal('edit-age') ? parseInt(getVal('edit-age')) : null,
+    gender: getVal('edit-gender') || null,
+    kps_score: getVal('edit-kps') ? parseInt(getVal('edit-kps')) : null,
+    diagnosis_date: getVal('edit-diagnosis-date') || null,
+    tumor_location: getVal('edit-tumor-location') || null,
+    surgery_type: getVal('edit-surgery-type') || null,
+    mgmt_status: getVal('edit-mgmt') || null,
+    idh1_status: getVal('edit-idh1') || null,
+    notes: getVal('edit-notes')?.trim() || null,
+  };
+
+  try {
+    const res = await fetch(API + '/api/patients/' + encodeURIComponent(_editPatientId), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('Guncelleme basarisiz: ' + res.status);
+    closeEditPatient();
+    loadPatients();
+    // Refresh report if currently viewing this patient
+    const sel = document.getElementById('report-select');
+    if (sel && sel.value === _editPatientId) loadReport(_editPatientId);
+  } catch (err) {
+    if (errEl) { errEl.textContent = err.message; errEl.style.display = 'block'; }
+  }
 }
 
 /* ── Hasta Zaman Çizelgesi ───────────────────────────────── */

@@ -14,6 +14,7 @@ import uuid
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, date
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +49,21 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 LUMIERE_IMG_DIR = Path(os.environ.get("LUMIERE_DIR", r"C:\Users\merte\Desktop\Lumiere\Imaging"))
 
+def _migrate_db() -> None:
+    from sqlalchemy import text
+    new_cols = [
+        ("patients", "tumor_location", "VARCHAR(100)"),
+        ("patients", "surgery_type", "VARCHAR(50)"),
+    ]
+    with engine.connect() as conn:
+        for table, col, coltype in new_cols:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                conn.commit()
+            except Exception:
+                pass
+
+
 def _cleanup_old_uploads(max_age_hours: int = 24) -> None:
     """Upload klasöründeki eski oturumları siler."""
     cutoff = datetime.now().timestamp() - max_age_hours * 3600
@@ -66,6 +82,7 @@ def _cleanup_old_uploads(max_age_hours: int = 24) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _migrate_db()
     logger.info("Database initialized")
     try:
         ref_db = precompute_reference_database()
@@ -117,79 +134,88 @@ def detect_modality(filename: str) -> dict:
 # NIfTI processing
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=12)
+def _nifti_data_cached(file_path: str):
+    """NIfTI verisini bellekte önbellekler — disk IO'yu tekrar eden isteklerde önler."""
+    img = nib.load(file_path)
+    return img.get_fdata(), tuple(img.shape[:3])
+
+
 def extract_nifti_slice(file_path: str, axis: str = "axial", index: int | None = None,
                         overlay_paths: list[str] | None = None) -> bytes:
     if not HAS_NIBABEL:
         return _placeholder_slice(axis, index or 0)
     try:
-        img = nib.load(file_path)
-        data = img.get_fdata()
+        data, shape = _nifti_data_cached(file_path)
     except Exception:
         return _placeholder_slice(axis, index or 0)
 
-    if data.ndim < 3:
+    if len(shape) < 3:
         return _placeholder_slice(axis, index or 0)
 
     if axis == "sagittal":
-        max_idx = data.shape[0] - 1
-        idx = index if index is not None else data.shape[0] // 2
-        idx = max(0, min(idx, max_idx))
+        idx = max(0, min(index if index is not None else shape[0] // 2, shape[0] - 1))
         slc = data[idx, :, :]
     elif axis == "coronal":
-        max_idx = data.shape[1] - 1
-        idx = index if index is not None else data.shape[1] // 2
-        idx = max(0, min(idx, max_idx))
+        idx = max(0, min(index if index is not None else shape[1] // 2, shape[1] - 1))
         slc = data[:, idx, :]
     else:
-        max_idx = data.shape[2] - 1
-        idx = index if index is not None else data.shape[2] // 2
-        idx = max(0, min(idx, max_idx))
+        idx = max(0, min(index if index is not None else shape[2] // 2, shape[2] - 1))
         slc = data[:, :, idx]
 
-    slc = np.rot90(slc)
-    if np.any(slc > 0):
-        vmin, vmax = np.percentile(slc[slc > 0], [2, 98])
+    slc = np.rot90(slc.copy())
+    pos = slc[slc > 0]
+    if pos.size:
+        vmin, vmax = np.percentile(pos, [2, 98])
     else:
         vmin, vmax = 0, 1
     if vmax <= vmin:
         vmax = vmin + 1
+
     slc_norm = np.clip((slc - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
     img_pil = Image.fromarray(slc_norm, mode="L").convert("RGB")
 
     if overlay_paths:
-        overlay = np.array(img_pil)
-        colors = {
-            1: [220, 50, 50],
-            2: [180, 120, 30],
-            4: [230, 230, 50],
-        }
+        overlay = np.array(img_pil, dtype=np.float32)
+        img_h, img_w = overlay.shape[:2]
+        seg_colors = {1: (220, 50, 50), 2: (180, 120, 30), 4: (230, 230, 50)}
         for op in overlay_paths:
             if not os.path.exists(op):
                 continue
             try:
-                seg = nib.load(op)
-                sd = seg.get_fdata()
+                sd, _ = _nifti_data_cached(op)
                 if axis == "sagittal":
                     ss = sd[idx, :, :]
                 elif axis == "coronal":
                     ss = sd[:, idx, :]
                 else:
                     ss = sd[:, :, idx]
-                ss = np.rot90(ss)
-                for label_val, color in colors.items():
-                    mask = ss == label_val
-                    if np.any(mask):
-                        for c in range(3):
-                            overlay[:, :, c] = np.where(mask,
-                                (overlay[:, :, c] * 0.5 + color[c] * 0.5).astype(np.uint8),
-                                overlay[:, :, c])
-                img_pil = Image.fromarray(overlay)
+                ss = np.rot90(ss.copy())
+                # Resize seg slice to match main image if resolutions differ
+                if ss.shape[0] != img_h or ss.shape[1] != img_w:
+                    ss_pil = Image.fromarray(np.round(ss).clip(0, 255).astype(np.uint8))
+                    ss_pil = ss_pil.resize((img_w, img_h), Image.NEAREST)
+                    ss = np.array(ss_pil, dtype=np.float32)
+                # Binary mask (0/1) → treat label 1 as whole tumor (red)
+                unique = set(np.unique(ss[ss > 0]).astype(int))
+                use_binary = unique <= {1}
+                for lv, color in seg_colors.items():
+                    mask = (ss == lv) if not use_binary else (ss > 0)
+                    if not np.any(mask):
+                        continue
+                    for c, cv in enumerate(color):
+                        overlay[:, :, c] = np.where(mask,
+                            overlay[:, :, c] * 0.45 + cv * 0.55,
+                            overlay[:, :, c])
+                    if use_binary:
+                        break
             except Exception:
                 continue
+        img_pil = Image.fromarray(overlay.clip(0, 255).astype(np.uint8))
 
-    img_pil = img_pil.resize((300, 300), Image.Resampling.LANCZOS)
+    img_pil = img_pil.resize((320, 320), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    img_pil.save(buf, format="PNG")
+    img_pil.save(buf, format="PNG", optimize=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -423,9 +449,14 @@ async def analyze(request: Request):
                 fi_copy["resolved_path"] = str(rp)
             resolved_files.append(fi_copy)
 
-    results = await run_in_threadpool(
-        run_real_analysis, patient_id, clinical, resolved_files, session_id, str(UPLOAD_DIR)
-    )
+    try:
+        results = await run_in_threadpool(
+            run_real_analysis, patient_id, clinical, resolved_files, session_id, str(UPLOAD_DIR)
+        )
+    except Exception as exc:
+        import traceback
+        logger.error("Analysis error: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(exc))
 
     db = SessionLocal()
     try:
@@ -439,6 +470,9 @@ async def analyze(request: Request):
                 mgmt_status=clinical.get("mgmt_status"),
                 idh1_status=clinical.get("idh1_status"),
                 treatment_protocol=clinical.get("treatment"),
+                tumor_location=clinical.get("tumor_location"),
+                surgery_type=clinical.get("surgery_type"),
+                diagnosis_date=date.fromisoformat(clinical["diagnosis_date"]) if clinical.get("diagnosis_date") else None,
                 dataset_source="web_upload",
             )
             db.add(patient)
@@ -531,11 +565,15 @@ async def get_patient(patient_id: str):
                 "mgmt_status": patient.mgmt_status,
                 "idh1_status": patient.idh1_status,
                 "treatment": patient.treatment_protocol,
+                "diagnosis_date": patient.diagnosis_date.isoformat() if patient.diagnosis_date else None,
+                "tumor_location": patient.tumor_location,
+                "surgery_type": patient.surgery_type,
             },
             "date": patient.created_at.strftime("%d.%m.%Y") if patient.created_at else "",
             "datetime": patient.created_at.isoformat() if patient.created_at else "",
             "survival_days": patient.survival_days,
             "status": patient.status,
+            "notes": patient.notes,
             "treatments": [
                 {
                     "drug_name": t.drug_name,
@@ -576,6 +614,42 @@ async def delete_patient(patient_id: str):
     except Exception as e:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+
+@app.put("/api/patients/{patient_id}")
+async def update_patient(patient_id: str, request: Request):
+    body = await request.json()
+    db = SessionLocal()
+    try:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise HTTPException(404)
+        field_converters = {
+            "age": lambda v: int(v) if v not in (None, "") else None,
+            "gender": lambda v: str(v) if v not in (None, "") else None,
+            "kps_score": lambda v: int(v) if v not in (None, "") else None,
+            "diagnosis_date": lambda v: date.fromisoformat(v) if v else None,
+            "tumor_location": lambda v: str(v) if v not in (None, "") else None,
+            "surgery_type": lambda v: str(v) if v not in (None, "") else None,
+            "mgmt_status": lambda v: str(v) if v not in (None, "") else None,
+            "idh1_status": lambda v: str(v) if v not in (None, "") else None,
+            "notes": lambda v: str(v) if v not in (None, "") else None,
+        }
+        for field, converter in field_converters.items():
+            if field in body:
+                try:
+                    setattr(p, field, converter(body[field]))
+                except Exception:
+                    pass
+        db.commit()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
     finally:
         db.close()
 
@@ -664,13 +738,28 @@ async def export_csv():
         writer = csv.writer(output)
         writer.writerow([
             "patient_id", "age", "gender", "kps_score", "mgmt_status",
-            "idh1_status", "treatment_protocol", "survival_days", "status", "notes"
+            "idh1_status", "treatment_protocol", "survival_days", "status",
+            "diagnosis_date", "tumor_location", "surgery_type",
+            "risk_score", "risk_class", "tumor_volume_cm3", "survival_6m_pct", "notes",
         ])
         for p in patients:
+            latest = (
+                db.query(Analysis)
+                .filter(Analysis.patient_pk == p.id)
+                .order_by(Analysis.created_at.desc())
+                .first()
+            )
             writer.writerow([
                 p.patient_id, p.age or "", p.gender or "", p.kps_score or "",
                 p.mgmt_status or "", p.idh1_status or "", p.treatment_protocol or "",
-                p.survival_days or "", p.status or "", p.notes or ""
+                p.survival_days or "", p.status or "",
+                p.diagnosis_date.isoformat() if p.diagnosis_date else "",
+                p.tumor_location or "", p.surgery_type or "",
+                round(latest.risk_score, 2) if latest and latest.risk_score is not None else "",
+                latest.risk_class or "" if latest else "",
+                round(latest.tumor_volume_cm3, 2) if latest and latest.tumor_volume_cm3 is not None else "",
+                round(latest.survival_6m_pct, 1) if latest and latest.survival_6m_pct is not None else "",
+                p.notes or "",
             ])
         output.seek(0)
         return StreamingResponse(

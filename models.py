@@ -23,6 +23,8 @@ class Patient(Base):
     survival_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, default="unknown")
     diagnosis_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    tumor_location: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    surgery_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dataset_source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, default="manual")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

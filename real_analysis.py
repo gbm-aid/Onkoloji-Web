@@ -142,6 +142,8 @@ def estimate_enhancing(core_data: np.ndarray | None, t1ce_data: np.ndarray | Non
                        voxel_vol: float) -> float:
     if core_data is None or t1ce_data is None:
         return 0.0
+    if core_data.shape != t1ce_data.shape:
+        return 0.0
     core_vals = t1ce_data[core_data]
     if len(core_vals) == 0:
         return 0.0
@@ -176,6 +178,8 @@ def compute_shape_features(mask_data: np.ndarray | None, voxel_vol: float) -> di
 
 def compute_intensity_features(image_data: np.ndarray, mask_data: np.ndarray,
                                modality: str) -> dict:
+    if image_data.shape != mask_data.shape:
+        return {}
     vals = image_data[mask_data]
     if len(vals) == 0:
         return {}
@@ -205,6 +209,8 @@ def compute_intensity_features(image_data: np.ndarray, mask_data: np.ndarray,
 
 
 def compute_texture_features(image_data: np.ndarray, mask_data: np.ndarray) -> dict:
+    if image_data.shape != mask_data.shape:
+        return {"contrast": 0.0, "homogeneity": 0.0, "correlation": 0.0}
     vals = image_data[mask_data].astype(np.float64)
     if len(vals) < 100:
         return {"contrast": 0.0, "homogeneity": 0.0, "correlation": 0.0}
