@@ -44,10 +44,97 @@ from real_analysis import run_real_analysis, precompute_reference_database
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gbmaid")
 
+try:
+    import anthropic as _anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 LUMIERE_IMG_DIR = Path(os.environ.get("LUMIERE_DIR", r"C:\Users\merte\Desktop\Lumiere\Imaging"))
+
+_LOC_LABELS = {
+    "frontal": "Frontal Lob", "temporal": "Temporal Lob", "parietal": "Parietal Lob",
+    "occipital": "Oksipital Lob", "insular": "İnsula", "multifocal": "Multifokal",
+}
+_SURG_LABELS = {
+    "GTR": "GTR (Gross Total Rezeksiyon)", "STR": "STR (Subtotal Rezeksiyon)",
+    "biopsy": "Sadece Biyopsi", "none": "Cerrahi Yok",
+}
+
+
+async def _generate_claude_summary(
+    clinical: dict, results: dict, treatments: list
+) -> str:
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not HAS_ANTHROPIC or not api_key:
+        return ""
+
+    rad = results.get("radiomics", {})
+
+    # Tedavi listesi
+    if treatments:
+        tx_lines = []
+        for t in treatments:
+            line = f"  • {t['drug_name']}"
+            if t.get("dosage"):
+                line += f" ({t['dosage']})"
+            if t.get("start_date"):
+                line += f", Başlangıç: {t['start_date']}"
+            if t.get("response"):
+                resp_map = {
+                    "complete": "Tam Yanıt", "partial": "Parsiyel Yanıt",
+                    "stable": "Stabil", "progression": "Progresyon",
+                }
+                line += f", Yanıt: {resp_map.get(t['response'], t['response'])}"
+            tx_lines.append(line)
+        tx_text = "\n".join(tx_lines)
+    else:
+        prot = clinical.get("treatment") or "belirtilmemiş"
+        tx_text = f"  • {prot} (henüz ilaç kaydı yok)"
+
+    gender_label = {"M": "Erkek", "F": "Kadın"}.get(clinical.get("gender", ""), "Belirtilmemiş")
+    loc_label = _LOC_LABELS.get(clinical.get("tumor_location", ""), clinical.get("tumor_location") or "Belirtilmemiş")
+    surg_label = _SURG_LABELS.get(clinical.get("surgery_type", ""), clinical.get("surgery_type") or "Belirtilmemiş")
+
+    prompt = f"""Sen deneyimli bir nöroonkoloji uzmanısın. Aşağıdaki GBM (Glioblastoma Multiforme) hastasının klinik verilerini değerlendirip kısa bir rapor yaz.
+
+**Hasta Profili**
+- Yaş: {clinical.get("age", "?")} | Cinsiyet: {gender_label} | KPS: {clinical.get("kps_score", "?")}
+- MGMT Metilasyonu: {clinical.get("mgmt_status", "bilinmiyor")}
+- IDH1: {clinical.get("idh1_status", "bilinmiyor")}
+- Tümör Lokalizasyonu: {loc_label}
+- Cerrahi: {surg_label}
+
+**Tedaviler**
+{tx_text}
+
+**MRI Radyomik Bulgular**
+- Whole Tumor: {rad.get("tumor_volume_cm3", 0):.1f} cm³
+- Nekrotik Core: {rad.get("core_volume_cm3", 0):.1f} cm³
+- Enhancing: {rad.get("enhancing_volume_cm3", 0):.1f} cm³
+- Ödem: {rad.get("edema_volume_cm3", 0):.1f} cm³
+
+**Risk Modeli**
+- Cox Risk Skoru: {results.get("risk_score", 0):.0f}/100 → {results.get("risk_label", "")} Risk
+- 6 Aylık Sağkalım Tahmini: %{results.get("survival_6m_pct", 0):.0f}
+
+Lütfen Türkçe, 2-3 paragraf, hekime yönelik akademik bir değerlendirme yaz. Tedavileri ve ilaçları mutlaka değerlendir — yanıt durumu varsa bunu vurgula. Son paragrafta radyomik bulgular ve risk tahmini hakkında yorum yap. Metnin başına veya sonuna herhangi bir başlık veya etiket ekleme."""
+
+    try:
+        client = _anthropic.AsyncAnthropic(api_key=api_key)
+        msg = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as exc:
+        logger.warning("Claude API summary error: %s", exc)
+        return ""
+
 
 def _migrate_db() -> None:
     from sqlalchemy import text
@@ -458,6 +545,7 @@ async def analyze(request: Request):
         logger.error("Analysis error: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(exc))
 
+    treatments_data: list[dict] = []
     db = SessionLocal()
     try:
         patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
@@ -497,11 +585,27 @@ async def analyze(request: Request):
         )
         db.add(analysis)
         db.commit()
+
+        # Mevcut tedavi kayitlarini Claude prompt'u icin al
+        treatments_data = [
+            {
+                "drug_name": t.drug_name,
+                "start_date": t.start_date.isoformat() if t.start_date else None,
+                "dosage": t.dosage,
+                "response": t.response,
+            }
+            for t in db.query(Treatment).filter(Treatment.patient_pk == patient.id).all()
+        ]
     except Exception as e:
         db.rollback()
         logger.error("DB error: %s", e)
     finally:
         db.close()
+
+    # Claude ile klinik ozet uret (API key varsa)
+    claude_text = await _generate_claude_summary(clinical, results, treatments_data)
+    if claude_text:
+        results["ai_summary"] = claude_text
 
     return {"patient_id": patient_id, "results": results}
 

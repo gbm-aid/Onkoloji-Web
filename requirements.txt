@@ -8,3 +8,4 @@ Pillow==11.0.0
 scipy
 sqlalchemy
 python-dotenv
+anthropic
