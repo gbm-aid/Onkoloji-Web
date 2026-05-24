@@ -1,0 +1,28 @@
+# Ortam ve konfigürasyon
+.env
+
+# Veritabanı (hasta verisi)
+*.db
+
+# Yüklenen NIfTI dosyaları (hasta verisi)
+uploads/
+
+# Oluşturulan referans veritabanı
+reference_db.json
+patients_db.json
+tcga_reference.json
+
+# Log dosyaları
+server.log
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+
+# Test sonuçları
+test-results/

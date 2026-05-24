@@ -17,11 +17,15 @@ from scipy import ndimage, stats
 
 logger = logging.getLogger("gbmaid.analysis")
 
-GBM_REF_DIR = Path(r"C:\Users\merte\Desktop\GBM")
-REF_DB_PATH = Path(__file__).resolve().parent / "tcga_reference.json"
+from dotenv import load_dotenv
+load_dotenv()
+
+GBM_REF_DIR = Path(os.environ.get("GBM_REF_DIR", r"C:\Users\merte\Desktop\GBM"))
+REF_DB_PATH = Path(__file__).resolve().parent / "reference_db.json"
 CALIBRATION_PATH = Path(__file__).resolve().parent / "model_calibration.json"
 
 _calibration_cache: dict | None = None
+_ref_db_cache: dict | None = None
 
 
 def _load_calibration() -> dict | None:
@@ -46,6 +50,62 @@ MASK_FILES = {
     "whole": "whole.nii.gz",
     "core": "core.nii.gz",
 }
+
+
+def compute_volumes_from_multilabel(seg_path: str) -> tuple:
+    """BraTS multi-label seg (1=necrotic, 2=edema, 4=enhancing) → separate masks."""
+    img = nib.load(seg_path)
+    data = img.get_fdata()
+    voxel_vol = float(np.prod(img.header.get_zooms()[:3]))
+    necrotic = (data == 1)
+    edema = (data == 2)
+    enhancing = (data == 4)
+    whole = necrotic | edema | enhancing
+    core = necrotic | enhancing
+    result = {
+        "tumor_volume_cm3": round(np.count_nonzero(whole) * voxel_vol / 1000, 2),
+        "core_volume_cm3": round(np.count_nonzero(core) * voxel_vol / 1000, 2),
+        "enhancing_volume_cm3": round(np.count_nonzero(enhancing) * voxel_vol / 1000, 2),
+        "edema_volume_cm3": round(np.count_nonzero(edema) * voxel_vol / 1000, 2),
+    }
+    return result, whole.astype(bool), core.astype(bool), voxel_vol
+
+
+def fetch_pubmed_refs(terms: list, max_results: int = 5) -> list:
+    """Gerçek PubMed E-utils API sorgusu ile referans listesi döndürür."""
+    import urllib.request
+    import urllib.parse
+    query = " ".join(terms)
+    try:
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urllib.parse.urlencode({
+            "db": "pubmed", "term": query, "retmax": max_results,
+            "retmode": "json", "sort": "relevance",
+        })
+        with urllib.request.urlopen(search_url, timeout=8) as resp:
+            search_data = json.loads(resp.read().decode())
+        pmids = search_data.get("esearchresult", {}).get("idlist", [])
+        if not pmids:
+            return []
+        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?" + urllib.parse.urlencode({
+            "db": "pubmed", "id": ",".join(pmids), "retmode": "json",
+        })
+        with urllib.request.urlopen(summary_url, timeout=8) as resp:
+            summary_data = json.loads(resp.read().decode())
+        refs = []
+        for pmid in pmids:
+            art = summary_data.get("result", {}).get(pmid, {})
+            if not art or art.get("error"):
+                continue
+            refs.append({
+                "pmid": pmid,
+                "title": art.get("title", "").rstrip("."),
+                "journal": art.get("source", ""),
+                "year": art.get("pubdate", "")[:4],
+            })
+        return refs
+    except Exception as e:
+        logger.warning("PubMed fetch failed: %s", e)
+        return []
 
 
 def compute_volumes(whole_path: str | None, core_path: str | None) -> dict:
@@ -430,8 +490,6 @@ def compute_projection(tumor_vol: float, risk_score: float) -> list[dict]:
         change = (vol - tumor_vol) / tumor_vol * 100 if tumor_vol > 0 else 0
         if change < 25:
             rano = "SD"
-        elif change < 50:
-            rano = "PD"
         else:
             rano = "PD"
         projection.append({
@@ -449,13 +507,15 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
 
     session_dir = Path(upload_dir) / session_id
 
-    whole_path = core_path = None
+    whole_path = core_path = seg_path = None
     image_paths = {}
 
     for fi in files_info:
-        safe_name = fi.get("safe_name", fi.get("filename", ""))
         mod = fi.get("modality", "")
-        fpath = str(session_dir / safe_name)
+        fpath = fi.get("resolved_path")
+        if not fpath:
+            safe_name = fi.get("safe_name", fi.get("filename", ""))
+            fpath = str(session_dir / safe_name)
 
         if not os.path.exists(fpath):
             continue
@@ -464,10 +524,15 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
             whole_path = fpath
         elif mod == "MASK-Core":
             core_path = fpath
+        elif mod == "SEG":
+            seg_path = fpath
         elif mod in ("T1", "T1ce", "T2", "FLAIR"):
             image_paths[mod] = fpath
 
-    volumes, whole_data, core_data, voxel_vol = compute_volumes(whole_path, core_path)
+    if seg_path:
+        volumes, whole_data, core_data, voxel_vol = compute_volumes_from_multilabel(seg_path)
+    else:
+        volumes, whole_data, core_data, voxel_vol = compute_volumes(whole_path, core_path)
 
     images = {}
     for mod, fpath in image_paths.items():
@@ -559,17 +624,27 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
     if idh1 != "unknown":
         lit_terms.append("IDH1 " + idh1)
 
+    fallback_refs = [
+        {"pmid": "16061997", "title": "Radiotherapy plus concomitant and adjuvant temozolomide for glioblastoma", "journal": "N Engl J Med", "year": "2005"},
+        {"pmid": "26516056", "title": "MGMT promoter methylation in malignant gliomas", "journal": "Nat Rev Clin Oncol", "year": "2015"},
+        {"pmid": "19228619", "title": "IDH1 and IDH2 mutations in gliomas", "journal": "N Engl J Med", "year": "2009"},
+        {"pmid": "33975139", "title": "Radiomics-based survival prediction in glioblastoma", "journal": "Front Oncol", "year": "2021"},
+    ]
+    pubmed_refs = fetch_pubmed_refs(lit_terms, max_results=5)
+    refs = pubmed_refs if pubmed_refs else fallback_refs
+
+    pmid_citations = " ".join(f"[PMID: {r['pmid']}]" for r in refs[:3])
     lit_summary = (
         f"Hasta profili (Yas: {age}, KPS: {kps}, MGMT: {mgmt}, IDH1: {idh1}) "
         "guncel literatur ile degerlendirildi. "
         f"Tumor hacmi {volumes['tumor_volume_cm3']:.1f} cm3 olarak segmentasyon masklarindan hesaplanmistir. "
-        "Stupp protokolu (TMZ + RT) standart birinci basamak tedavi olarak onerilmektedir [PMID: 16061997]. "
+        f"Stupp protokolu (TMZ + RT) standart birinci basamak tedavi olarak onerilmektedir {pmid_citations}. "
     )
     if mgmt == "methylated":
-        lit_summary += "MGMT promotor metilasyonu olan hastalarda TMZ yanit orani anlamli sekilde yuksektir [PMID: 26516056]. "
+        lit_summary += "MGMT promotor metilasyonu olan hastalarda TMZ yanit orani anlamli sekilde yuksektir. "
     if idh1 == "mutant":
-        lit_summary += "IDH1 mutasyonu pozitif hastalarda prognoz daha olumlu seyretmektedir [PMID: 19228619]. "
-    lit_summary += "Radyomik tabanli modeller sagkalim tahminini desteklemektedir [PMID: 33975139]."
+        lit_summary += "IDH1 mutasyonu pozitif hastalarda prognoz daha olumlu seyretmektedir. "
+    lit_summary += "Radyomik tabanli modeller sagkalim tahminini desteklemektedir."
 
     ai_summary = (
         f"Segmentasyon masklarindan hesaplanan gercek tumor hacimleri: "
@@ -588,7 +663,7 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
 
     if similar:
         ai_summary += (
-            f"TCGA-GBM kohortundan en benzer {len(similar)} hasta ile karsilastirilmistir "
+            f"LUMIERE kohortundan en benzer {len(similar)} hasta ile karsilastirilmistir "
             f"(en yuksek benzerlik: {similar[0]['similarity']:.2%}). "
         )
 
@@ -596,7 +671,7 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
     n_feats = len(intensity) + len(texture) + len(shape) + 4
     if cal:
         n_cal = cal.get("n_patients", 0)
-        ai_summary += f"Risk modeli {n_cal} hastadan (LUMIERE+TCGA) kalibre edilmistir. "
+        ai_summary += f"Risk modeli {n_cal} hastadan (LUMIERE) kalibre edilmistir. "
     ai_summary += f"Toplam {n_feats} radyomik ozellik gercek NIfTI verilerinden cikarilmistir."
 
     report_id = f"GA-RPT-{uuid.uuid4().hex[:8].upper()}"
@@ -613,12 +688,8 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
         "literature": {
             "terms": lit_terms,
             "summary": lit_summary,
-            "refs": [
-                {"pmid": "16061997", "title": "Radiotherapy plus concomitant and adjuvant temozolomide for glioblastoma", "journal": "N Engl J Med", "year": 2005},
-                {"pmid": "26516056", "title": "MGMT promoter methylation in malignant gliomas", "journal": "Nat Rev Clin Oncol", "year": 2015},
-                {"pmid": "19228619", "title": "IDH1 and IDH2 mutations in gliomas", "journal": "N Engl J Med", "year": 2009},
-                {"pmid": "33975139", "title": "Radiomics-based survival prediction in glioblastoma", "journal": "Front Oncol", "year": 2021},
-            ],
+            "refs": refs,
+            "source": "pubmed" if pubmed_refs else "fallback",
         },
         "ai_summary": ai_summary,
     }

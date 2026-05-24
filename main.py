@@ -12,14 +12,20 @@ import os
 import re
 import uuid
 import json
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 try:
@@ -40,30 +46,41 @@ logger = logging.getLogger("gbmaid")
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-LUMIERE_IMG_DIR = Path(r"C:\Users\merte\Desktop\Lumiere\Imaging")
+LUMIERE_IMG_DIR = Path(os.environ.get("LUMIERE_DIR", r"C:\Users\merte\Desktop\Lumiere\Imaging"))
 
-app = FastAPI(title="GBM-AID", version="5.0.0")
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+def _cleanup_old_uploads(max_age_hours: int = 24) -> None:
+    """Upload klasöründeki eski oturumları siler."""
+    cutoff = datetime.now().timestamp() - max_age_hours * 3600
+    removed = 0
+    for session_dir in UPLOAD_DIR.iterdir():
+        if not session_dir.is_dir():
+            continue
+        if session_dir.stat().st_mtime < cutoff:
+            import shutil
+            shutil.rmtree(session_dir, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("Upload cleanup: %d eski oturum silindi", removed)
 
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized")
     try:
         ref_db = precompute_reference_database()
+        app.state.ref_db = ref_db
         logger.info("Reference database: %d patients", len(ref_db.get("patients", {})))
     except Exception as e:
         logger.warning("Could not precompute reference DB: %s", e)
+        app.state.ref_db = {}
+    await run_in_threadpool(_cleanup_old_uploads)
+    yield
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+app = FastAPI(title="GBM-AID", version="5.0.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +258,16 @@ async def upload_files(files: list[UploadFile] = File(...)):
     return {"session_id": session_id, "files": results}
 
 
-def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "week-000") -> Path | None:
-    pdir = LUMIERE_IMG_DIR / patient_id / timepoint
-    if not pdir.exists():
+def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "") -> Path | None:
+    patient_dir = LUMIERE_IMG_DIR / patient_id
+    if not patient_dir.exists():
+        return None
+    if timepoint:
+        pdir = patient_dir / timepoint
+    else:
+        tps = sorted([d.name for d in patient_dir.iterdir() if d.is_dir() and d.name.startswith("week-")])
+        pdir = patient_dir / tps[0] if tps else None
+    if not pdir or not pdir.exists():
         return None
     fmap = {
         "CT1.nii.gz": pdir / "CT1.nii.gz",
@@ -262,13 +286,38 @@ def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "week
     return None
 
 
+@app.get("/api/lumiere-patients")
+async def lumiere_patients():
+    if not LUMIERE_IMG_DIR.exists():
+        return {"patients": []}
+    patients = []
+    for pdir in sorted(LUMIERE_IMG_DIR.iterdir()):
+        if not pdir.is_dir() or not pdir.name.startswith("Patient-"):
+            continue
+        timepoints = sorted([d.name for d in pdir.iterdir() if d.is_dir() and d.name.startswith("week-")])
+        if not timepoints:
+            continue
+        first_tp = timepoints[0]
+        tp_dir = pdir / first_tp
+        mri_count = sum(1 for f in ("CT1.nii.gz", "FLAIR.nii.gz", "T1.nii.gz", "T2.nii.gz") if (tp_dir / f).exists())
+        patients.append({
+            "patient_id": pdir.name,
+            "timepoints": timepoints,
+            "default_timepoint": first_tp,
+            "mri_count": mri_count,
+        })
+    return {"patients": patients}
+
+
 @app.get("/api/lumiere-files/{patient_id}")
-async def lumiere_files(patient_id: str, timepoint: str = "week-000"):
+async def lumiere_files(patient_id: str, timepoint: str = ""):
     pdir = LUMIERE_IMG_DIR / patient_id
     if not pdir.exists():
         return {"files": [], "timepoints": []}
 
     timepoints = sorted([d.name for d in pdir.iterdir() if d.is_dir() and d.name.startswith("week-")])
+    if not timepoint or timepoint not in timepoints:
+        timepoint = timepoints[0] if timepoints else "week-000"
     tp_dir = pdir / timepoint
     if not tp_dir.exists():
         return {"files": [], "timepoints": timepoints}
@@ -320,7 +369,7 @@ async def get_slice(session_id: str, filename: str, axis: str = "axial", index: 
     if session_id.startswith("Patient-"):
         parts = session_id.split(":", 1)
         pid = parts[0]
-        tp = parts[1] if len(parts) > 1 else "week-000"
+        tp = parts[1] if len(parts) > 1 else ""
         fp_candidate = _resolve_lumiere_path(pid, filename, tp)
         if fp_candidate:
             fp = fp_candidate
@@ -340,7 +389,7 @@ async def get_slice(session_id: str, filename: str, axis: str = "axial", index: 
             if session_id.startswith("Patient-"):
                 parts = session_id.split(":", 1)
                 pid = parts[0]
-                tp = parts[1] if len(parts) > 1 else "week-000"
+                tp = parts[1] if len(parts) > 1 else ""
                 ov_path = _resolve_lumiere_path(pid, ov_name, tp)
             if ov_path is None:
                 ov_safe = re.sub(r"[^\w.\-]", "_", ov_name)
@@ -360,7 +409,23 @@ async def analyze(request: Request):
     files_info = body.get("files", [])
     session_id = body.get("session_id", "")
 
-    results = run_real_analysis(patient_id, clinical, files_info, session_id, str(UPLOAD_DIR))
+    resolved_files = files_info
+    if session_id.startswith("Patient-"):
+        parts = session_id.split(":", 1)
+        pid = parts[0]
+        tp = parts[1] if len(parts) > 1 else ""
+        resolved_files = []
+        for fi in files_info:
+            fi_copy = dict(fi)
+            fname = fi.get("filename", "")
+            rp = _resolve_lumiere_path(pid, fname, tp)
+            if rp:
+                fi_copy["resolved_path"] = str(rp)
+            resolved_files.append(fi_copy)
+
+    results = await run_in_threadpool(
+        run_real_analysis, patient_id, clinical, resolved_files, session_id, str(UPLOAD_DIR)
+    )
 
     db = SessionLocal()
     try:
@@ -640,10 +705,8 @@ async def add_treatment(patient_id: str, request: Request):
             notes=body.get("notes"),
         )
         if body.get("start_date"):
-            from datetime import date
             treatment.start_date = date.fromisoformat(body["start_date"])
         if body.get("end_date"):
-            from datetime import date
             treatment.end_date = date.fromisoformat(body["end_date"])
 
         db.add(treatment)
@@ -787,6 +850,90 @@ async def db_table(table_name: str, limit: int = 100, offset: int = 0):
             raise HTTPException(400, f"Unknown table: {table_name}")
 
         return {"table": table_name, "total": total, "offset": offset, "limit": limit, "rows": data}
+    finally:
+        db.close()
+
+
+@app.get("/api/cohort-stats")
+async def cohort_stats():
+    db = SessionLocal()
+    try:
+        total_patients = db.query(Patient).count()
+        analyzed = db.query(Analysis.patient_pk).distinct().count()
+
+        analyses = db.query(Analysis).all()
+        risk_dist = {"low": 0, "medium": 0, "high": 0}
+        risk_sum = surv_sum = risk_count = 0
+        for a in analyses:
+            if a.risk_class in risk_dist:
+                risk_dist[a.risk_class] += 1
+            if a.risk_score is not None:
+                risk_sum += a.risk_score
+                risk_count += 1
+            if a.survival_6m_pct is not None:
+                surv_sum += a.survival_6m_pct
+
+        avg_risk = round(risk_sum / risk_count, 1) if risk_count else 0
+        avg_surv = round(surv_sum / risk_count, 1) if risk_count else 0
+
+        mgmt_dist: dict = {}
+        idh1_dist: dict = {}
+        age_bins = {"<40": 0, "40-50": 0, "50-60": 0, "60-70": 0, ">70": 0}
+
+        for p in db.query(Patient).all():
+            mgmt_key = p.mgmt_status or "bilinmiyor"
+            idh1_key = p.idh1_status or "bilinmiyor"
+            mgmt_dist[mgmt_key] = mgmt_dist.get(mgmt_key, 0) + 1
+            idh1_dist[idh1_key] = idh1_dist.get(idh1_key, 0) + 1
+            if p.age is not None:
+                if p.age < 40: age_bins["<40"] += 1
+                elif p.age < 50: age_bins["40-50"] += 1
+                elif p.age < 60: age_bins["50-60"] += 1
+                elif p.age < 70: age_bins["60-70"] += 1
+                else: age_bins[">70"] += 1
+
+        return {
+            "total_patients": total_patients,
+            "analyzed": analyzed,
+            "avg_risk": avg_risk,
+            "avg_surv": avg_surv,
+            "risk_dist": risk_dist,
+            "mgmt_dist": mgmt_dist,
+            "idh1_dist": idh1_dist,
+            "age_bins": age_bins,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/timeline")
+async def patient_timeline(patient_id: str):
+    db = SessionLocal()
+    try:
+        patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not patient:
+            raise HTTPException(404)
+        analyses = (
+            db.query(Analysis)
+            .filter(Analysis.patient_pk == patient.id)
+            .order_by(Analysis.created_at.asc())
+            .all()
+        )
+        return {
+            "patient_id": patient_id,
+            "timeline": [
+                {
+                    "report_id": a.report_id,
+                    "risk_score": a.risk_score,
+                    "risk_class": a.risk_class,
+                    "risk_label": a.risk_label,
+                    "survival_6m_pct": a.survival_6m_pct,
+                    "tumor_volume_cm3": a.tumor_volume_cm3,
+                    "created_at": a.created_at.strftime("%d.%m.%Y") if a.created_at else "",
+                }
+                for a in analyses
+            ],
+        }
     finally:
         db.close()
 

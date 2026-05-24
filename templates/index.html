@@ -17,7 +17,7 @@
   <nav class="topbar-nav">
     <a href="#" data-page="analysis" class="active">Analiz</a>
     <a href="#" data-page="records">Hasta Kayitlari</a>
-    <a href="#" data-page="database">Veritabani</a>
+    <a href="#" data-page="database">Kohort</a>
     <a href="#" data-page="reports">Raporlar</a>
     <a href="#" data-page="help">Yardim</a>
   </nav>
@@ -100,13 +100,13 @@
                 <div class="upload-hint">NIfTI &middot; DICOM &middot; NRRD &middot; MHA &middot; PNG &middot; JPG</div>
                 <div class="upload-btns">
                   <button class="btn btn-primary" type="button" onclick="triggerFileSelect()">Dosya Sec</button>
-                  <button class="btn btn-green" type="button" onclick="triggerFileSelect()">Klasor Sec (TCGA)</button>
+                  <button class="btn btn-green" type="button" onclick="openLumiereModal()">Lumiere Hasta Sec</button>
                 </div>
               </div>
               <input type="file" id="file-input" multiple accept=".nii,.nii.gz,.gz,.dcm,.nrrd,.mha,.png,.jpg" style="display:none">
               <div class="upload-info">
                 T1, T2, FLAIR, T1ce ve mask (whole/core/enh) dosyalari otomatik taninir.
-                TCGA klasoru secince hasta verileri otomatik dolar.
+                Lumiere hastasi secince MR dosyalari otomatik yuklenir.
               </div>
             </div>
           </div>
@@ -147,8 +147,8 @@
           <div class="card-body">
 
             <div class="form-group">
-              <label class="form-label">Hasta Adi / TCGA ID</label>
-              <input type="text" id="inp-pid" class="form-input" placeholder="orn. TCGA-02-0003 veya Ali Yildiz" style="max-width:480px">
+              <label class="form-label">Hasta Adi / ID</label>
+              <input type="text" id="inp-pid" class="form-input" placeholder="orn. Patient-001 veya Ali Yildiz" style="max-width:480px">
             </div>
 
             <div class="grid-4col">
@@ -370,7 +370,7 @@
       <div class="card">
         <div class="section-head">
           <div class="section-title">YAPAY ZEKA DEGERLENDIRMESI</div>
-          <span class="ai-engine-badge">Claude Sonnet</span>
+          <span class="ai-engine-badge">GBM-AID Motor</span>
         </div>
         <div class="card-body">
           <p class="ai-text" id="ai-text"></p>
@@ -389,11 +389,9 @@
               <tr>
                 <th>Hasta ID</th>
                 <th>Benzerlik</th>
-                <th>Yas</th>
-                <th>KPS</th>
-                <th>MGMT</th>
-                <th>Sagkalim</th>
-                <th>Tedaviler</th>
+                <th>Whole Vol.</th>
+                <th>Core Vol.</th>
+                <th>Modaliteler</th>
               </tr>
             </thead>
             <tbody id="cohort-tbody"></tbody>
@@ -491,58 +489,51 @@
     </div>
   </div>
 
-  <!-- ━━━ PAGE: DATABASE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <!-- ━━━ PAGE: KOHORT İSTATİSTİKLERİ ━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <div id="page-database" class="page">
 
-    <!-- Stats cards -->
-    <div class="kpi-row" id="db-stats-row">
+    <div class="kpi-row">
       <div class="kpi-card">
-        <div class="kpi-label">Hastalar</div>
-        <div class="kpi-value" id="db-stat-patients">-</div>
-        <div class="kpi-sub">patients tablosu</div>
+        <div class="kpi-label">Toplam Hasta</div>
+        <div class="kpi-value" id="cs-total">-</div>
+        <div class="kpi-sub">kayitli hasta</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Analizler</div>
-        <div class="kpi-value" id="db-stat-analyses">-</div>
-        <div class="kpi-sub">analyses tablosu</div>
+        <div class="kpi-label">Analiz Edilmis</div>
+        <div class="kpi-value" id="cs-analyzed">-</div>
+        <div class="kpi-sub">MRI analizi mevcut</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Tedaviler</div>
-        <div class="kpi-value" id="db-stat-treatments">-</div>
-        <div class="kpi-sub">treatments tablosu</div>
+        <div class="kpi-label">Ort. Risk Skoru</div>
+        <div class="kpi-value" id="cs-avg-risk">-</div>
+        <div class="kpi-sub">kohort ortalamasi</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Ort. 6-Ay Sagkalim</div>
+        <div class="kpi-value" id="cs-avg-surv">-</div>
+        <div class="kpi-sub">model tahmini</div>
       </div>
     </div>
 
-    <!-- Fill rate info -->
-    <div class="card" style="margin-bottom:16px">
-      <div class="section-head">
-        <div class="section-title">VERITABANI DURUMU</div>
-        <span class="section-badge" id="db-size-badge">-</span>
+    <div class="grid-2col">
+      <div class="card">
+        <div class="section-head"><div class="section-title">RISK SINIFI DAGILIMI</div></div>
+        <div class="card-body" id="cs-risk-chart"><div class="empty" style="padding:30px 0"><p>Veri yukleniyor...</p></div></div>
       </div>
-      <div class="card-body" id="db-fill-info" style="font-size:13px">Yukleniyor...</div>
+      <div class="card">
+        <div class="section-head"><div class="section-title">YAS DAGILIMI</div></div>
+        <div class="card-body" id="cs-age-chart"><div class="empty" style="padding:30px 0"><p>Veri yukleniyor...</p></div></div>
+      </div>
     </div>
 
-    <!-- Table selector -->
-    <div class="card">
-      <div class="section-head">
-        <div class="section-title">TABLO GORUNTULE</div>
+    <div class="grid-2col">
+      <div class="card">
+        <div class="section-head"><div class="section-title">MGMT METILASYON DURUMU</div></div>
+        <div class="card-body" id="cs-mgmt-chart"><div class="empty" style="padding:30px 0"><p>Veri yukleniyor...</p></div></div>
       </div>
-      <div style="padding:12px 20px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border-light)">
-        <button class="btn btn-primary btn-sm db-tab-btn active" onclick="loadDBTable('patients', this)">Patients</button>
-        <button class="btn btn-outline btn-sm db-tab-btn" onclick="loadDBTable('analyses', this)">Analyses</button>
-        <button class="btn btn-outline btn-sm db-tab-btn" onclick="loadDBTable('treatments', this)">Treatments</button>
-        <span style="margin-left:auto;font-size:11px;color:var(--text-muted)" id="db-table-info"></span>
-      </div>
-      <div style="overflow-x:auto">
-        <table class="dtable" id="db-table">
-          <thead id="db-table-head"></thead>
-          <tbody id="db-table-body"></tbody>
-        </table>
-      </div>
-      <div style="padding:10px 20px;display:flex;align-items:center;gap:10px;border-top:1px solid var(--border-light)">
-        <button class="btn btn-outline btn-sm" id="db-prev-btn" onclick="dbPagePrev()" disabled>Onceki</button>
-        <span style="font-size:12px;color:var(--text-muted)" id="db-page-info">-</span>
-        <button class="btn btn-outline btn-sm" id="db-next-btn" onclick="dbPageNext()">Sonraki</button>
+      <div class="card">
+        <div class="section-head"><div class="section-title">IDH1 MUTASYON DURUMU</div></div>
+        <div class="card-body" id="cs-idh1-chart"><div class="empty" style="padding:30px 0"><p>Veri yukleniyor...</p></div></div>
       </div>
     </div>
 
@@ -600,9 +591,7 @@
       <div class="card-body">
         <div class="help-block">
           <ul>
-            <li><strong>TCGA-GBM:</strong> 260 hasta &mdash; klinik, radyomik ve omics verileri.</li>
-            <li><strong>UPenn-GBM:</strong> 611 hasta &mdash; klinik ve radyomik.</li>
-            <li><strong>LUMIERE:</strong> 91 hasta &mdash; longitudinal tumor hacim takip verileri.</li>
+            <li><strong>LUMIERE:</strong> 91 hasta &mdash; longitudinal MR goruntuleme ve tumor hacim takip verileri.</li>
           </ul>
         </div>
       </div>
@@ -640,6 +629,21 @@
 <footer class="footer">
   GBM-AID Klinik Karar Destek Sistemi v5.0 &mdash; Glioblastoma Multiforme &mdash; SQLite DB
 </footer>
+
+<!-- Lumiere Patient Modal -->
+<div id="lumiere-modal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div class="section-title">LUMIERE HASTA SEC</div>
+      <button class="modal-close" onclick="closeLumiereModal()">&times;</button>
+    </div>
+    <div style="padding:12px 20px;border-bottom:1px solid var(--border-light);display:flex;gap:10px;align-items:center">
+      <input type="text" id="lumiere-search" class="form-input" placeholder="Hasta ara (orn. Patient-001)" style="flex:1" oninput="filterLumiereList()">
+      <span id="lumiere-count" style="font-size:12px;color:var(--text-muted)">0 hasta</span>
+    </div>
+    <div id="lumiere-list" class="modal-list"></div>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 

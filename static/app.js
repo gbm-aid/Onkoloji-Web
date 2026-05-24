@@ -44,17 +44,17 @@ function switchPage(id) {
   if (link) link.classList.add('active');
 
   // Update breadcrumb
-  const labels = { analysis: 'Analiz', records: 'Hasta Kayitlari', database: 'Veritabani', reports: 'Raporlar', help: 'Yardim' };
+  const labels = { analysis: 'Analiz', records: 'Hasta Kayitlari', database: 'Kohort Istatistikleri', reports: 'Raporlar', help: 'Yardim' };
   const bc = document.getElementById('breadcrumb-current');
   if (bc) bc.textContent = labels[id] || id;
 
   const ph = document.getElementById('page-title');
-  const titles = { analysis: 'Yeni Analiz Baslat', records: 'Hasta Kayitlari', database: 'Veritabani Yonetimi', reports: 'Raporlar', help: 'Yardim' };
+  const titles = { analysis: 'Yeni Analiz Baslat', records: 'Hasta Kayitlari', database: 'Kohort Analizi', reports: 'Raporlar', help: 'Yardim' };
   if (ph) ph.textContent = titles[id] || '';
 
   if (id === 'records') loadPatients();
   if (id === 'reports') loadReportsList();
-  if (id === 'database') { loadDBStats(); loadDBTable('patients'); }
+  if (id === 'database') loadCohortStats();
 }
 
 /* ── Stepper ──────────────────────────────────────────────── */
@@ -82,7 +82,10 @@ function setupUploadZone() {
   const input = document.getElementById('file-input');
   if (!zone || !input) return;
 
-  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('click', e => {
+    if (e.target.closest('button')) return;
+    input.click();
+  });
   zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
   zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
   zone.addEventListener('drop', e => {
@@ -174,6 +177,99 @@ function showClinicalForm() {
   const el = document.getElementById('clinical-section');
   if (el) el.style.display = 'block';
   setStep(3);
+}
+
+/* ── Lumiere Patient Selection ────────────────────────────── */
+
+let lumiereData = [];
+
+async function openLumiereModal() {
+  const modal = document.getElementById('lumiere-modal');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  showLoader('Lumiere hastalari yukleniyor...');
+  try {
+    const res = await fetch(API + '/api/lumiere-patients');
+    const data = await res.json();
+    lumiereData = data.patients || [];
+    document.getElementById('lumiere-count').textContent = lumiereData.length + ' hasta';
+    renderLumiereList(lumiereData);
+  } catch (err) {
+    document.getElementById('lumiere-list').innerHTML = '<div style="padding:20px;color:var(--red)">Yuklenemedi: ' + err.message + '</div>';
+  } finally {
+    hideLoader();
+  }
+}
+
+function closeLumiereModal() {
+  const modal = document.getElementById('lumiere-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function filterLumiereList() {
+  const q = (document.getElementById('lumiere-search')?.value || '').toLowerCase();
+  const filtered = lumiereData.filter(p => p.patient_id.toLowerCase().includes(q));
+  renderLumiereList(filtered);
+}
+
+function renderLumiereList(patients) {
+  const el = document.getElementById('lumiere-list');
+  if (!el) return;
+  if (!patients.length) {
+    el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted)">Hasta bulunamadi</div>';
+    return;
+  }
+  el.innerHTML = patients.map(p => `
+    <div class="lum-item" onclick="selectLumierePatient('${esc(p.patient_id)}','${esc(p.default_timepoint)}')">
+      <span class="lum-pid">${esc(p.patient_id)}</span>
+      <span class="lum-info">${p.timepoints.length} zaman noktasi</span>
+      <span class="lum-badge">${p.mri_count}/4 MR</span>
+    </div>
+  `).join('');
+}
+
+async function selectLumierePatient(patientId, defaultTp) {
+  closeLumiereModal();
+  showLoader('MR dosyalari yukleniyor...');
+  try {
+    const res = await fetch(API + '/api/lumiere-files/' + encodeURIComponent(patientId) + '?timepoint=' + encodeURIComponent(defaultTp));
+    const data = await res.json();
+    if (!data.files || data.files.length === 0) {
+      alert('Bu hasta icin MR dosyasi bulunamadi.');
+      hideLoader();
+      return;
+    }
+
+    const tp = data.timepoint || defaultTp;
+    state.sessionId = patientId + ':' + tp;
+    state.lumierePatientId = patientId;
+    state.lumiereTimepoint = tp;
+    state.lumiereTimepoints = data.timepoints || [];
+
+    state.files = data.files.map(f => ({
+      filename: f.filename,
+      safe_name: f.filename,
+      size_mb: f.size_mb || 0,
+      modality: f.modality,
+      modality_label: f.modality_label || f.modality,
+      confidence: 99,
+      shape: f.shape || [182, 218, 182],
+      voxel_size: f.voxel_size || [1, 1, 1],
+    }));
+
+    setStep(2);
+    renderMatchTable();
+    renderFileCount();
+
+    const pidInput = document.getElementById('inp-pid');
+    if (pidInput) pidInput.value = patientId;
+
+    showClinicalForm();
+  } catch (err) {
+    alert('Dosya yuklenemedi: ' + err.message);
+  } finally {
+    hideLoader();
+  }
 }
 
 /* ── Analysis ─────────────────────────────────────────────── */
@@ -323,7 +419,7 @@ function setupViewer() {
 function updateViewerImage(mainFile, segFiles) {
   const img = document.getElementById('viewer-img');
   if (!img) return;
-  let url = `${API}/api/slice/${state.sessionId}/${encodeURIComponent(mainFile.filename)}?axis=${state.viewerAxis}&index=${state.viewerSlice}`;
+  let url = `${API}/api/slice/${encodeURIComponent(state.sessionId)}/${encodeURIComponent(mainFile.filename)}?axis=${state.viewerAxis}&index=${state.viewerSlice}`;
   if (segFiles.length) {
     url += '&overlays=' + segFiles.map(f => encodeURIComponent(f.filename)).join(',');
   }
@@ -343,19 +439,15 @@ function updateSliceReadout() {
 function renderCohort(patients) {
   const tbody = document.getElementById('cohort-tbody');
   if (!tbody || !patients) return;
-  tbody.innerHTML = patients.map(p => {
-    const hasAge = p.age != null;
-    return `
+  tbody.innerHTML = patients.map(p => `
     <tr>
       <td style="font-weight:600;font-family:var(--mono);font-size:12px">${esc(p.id)}</td>
       <td>${(p.similarity * 100).toFixed(1)}%</td>
-      <td>${hasAge ? p.age : (p.tumor_volume_cm3 ? p.tumor_volume_cm3.toFixed(1) + ' cm3' : '-')}</td>
-      <td>${hasAge ? p.kps : (p.core_volume_cm3 ? p.core_volume_cm3.toFixed(1) + ' cm3' : '-')}</td>
-      <td>${p.mgmt || (p.available_modalities ? p.available_modalities.join(', ') : '-')}</td>
-      <td>${p.survival_days ? p.survival_days + ' gun' : '-'}</td>
-      <td>${p.treatments ? p.treatments.join(', ') : '-'}</td>
-    </tr>`;
-  }).join('');
+      <td>${p.tumor_volume_cm3 ? p.tumor_volume_cm3.toFixed(1) + ' cm³' : '-'}</td>
+      <td>${p.core_volume_cm3 ? p.core_volume_cm3.toFixed(1) + ' cm³' : '-'}</td>
+      <td style="font-size:11px">${p.available_modalities ? p.available_modalities.join(', ') : '-'}</td>
+    </tr>`
+  ).join('');
 }
 
 /* ── Literature ───────────────────────────────────────────── */
@@ -365,10 +457,17 @@ function renderLiterature(lit) {
   const el = document.getElementById('lit-content');
   if (!el) return;
 
+  const srcLabel = lit.source === 'pubmed'
+    ? '<span style="color:var(--green);font-size:11px;font-weight:600">PubMed canli sorgu</span>'
+    : '<span style="color:var(--orange);font-size:11px">Statik referanslar (PubMed ulasılamadı)</span>';
+
   let html = `
-    <div style="margin-bottom:10px">
-      <span style="font-size:12px;color:var(--text-muted)">Sorgu terimleri: </span>
-      ${lit.terms.map(t => `<span style="background:var(--bg);padding:2px 8px;border-radius:3px;font-size:11px;margin-right:3px;font-family:var(--mono)">${esc(t)}</span>`).join('')}
+    <div style="margin-bottom:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div>
+        <span style="font-size:12px;color:var(--text-muted)">Sorgu terimleri: </span>
+        ${lit.terms.map(t => `<span style="background:var(--bg);padding:2px 8px;border-radius:3px;font-size:11px;margin-right:3px;font-family:var(--mono)">${esc(t)}</span>`).join('')}
+      </div>
+      ${srcLabel}
     </div>
     <div class="lit-summary">${esc(lit.summary)}</div>
   `;
@@ -530,7 +629,7 @@ async function loadReport(pid) {
       </div>
 
       ${r.ai_summary ? `
-      <div class="card"><div class="section-head"><div class="section-title">Yapay Zeka Degerlendirmesi</div><span class="ai-engine-badge">Claude Sonnet</span></div>
+      <div class="card"><div class="section-head"><div class="section-title">Yapay Zeka Degerlendirmesi</div><span class="ai-engine-badge">GBM-AID Motor</span></div>
         <div class="card-body"><p class="ai-text">${esc(r.ai_summary)}</p></div>
       </div>` : ''}
 
@@ -556,9 +655,11 @@ async function loadReport(pid) {
         </div>
       </div>` : ''}
 
+      <div id="report-timeline-container"></div>
       <div id="report-viewer-container"></div>
     `;
 
+    loadTimeline(d.patient_id);
     loadReportViewer(d.patient_id);
   } catch (err) {
     el.innerHTML = '<p style="color:var(--red)">Rapor yuklenemedi.</p>';
@@ -632,7 +733,7 @@ async function loadReportViewer(patientId) {
       mainFile: mainFile.filename,
       segFiles: segFiles.map(f => f.filename),
       shape: shape,
-      timepoint: data.timepoint || 'week-000',
+      timepoint: data.timepoint || (data.timepoints && data.timepoints[0]) || '',
     };
     rvUpdateImage();
   } catch (err) {
@@ -792,7 +893,7 @@ function exportCSV() {
 
 function downloadCSVTemplate() {
   const header = 'patient_id,age,gender,kps_score,mgmt_status,idh1_status,treatment_protocol,survival_days,status,notes';
-  const example = 'TCGA-XX-XXXX,55,M,80,methylated,wildtype,stupp,420,deceased,ornek kayit';
+  const example = 'Patient-001,55,M,80,methylated,wildtype,stupp,420,deceased,ornek kayit';
   const blob = new Blob([header + '\n' + example + '\n'], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -801,110 +902,104 @@ function downloadCSVTemplate() {
   URL.revokeObjectURL(a.href);
 }
 
-/* ── Database Viewer ─────────────────────────────────────── */
+/* ── Kohort İstatistikleri ───────────────────────────────── */
 
-let dbState = { table: 'patients', offset: 0, limit: 50, total: 0 };
+const RISK_COLORS = { low: 'var(--green)', medium: 'var(--yellow)', high: 'var(--red)' };
+const RISK_LABELS = { low: 'Dusuk', medium: 'Orta', high: 'Yuksek' };
+const MGMT_COLORS = { methylated: 'var(--green)', unmethylated: 'var(--red)', bilinmiyor: 'var(--text-faint)', unknown: 'var(--text-faint)' };
+const IDH1_COLORS = { mutant: 'var(--blue)', wildtype: 'var(--orange)', 'wild-type': 'var(--orange)', bilinmiyor: 'var(--text-faint)', unknown: 'var(--text-faint)' };
 
-async function loadDBStats() {
+async function loadCohortStats() {
   try {
-    const res = await fetch(API + '/api/db/stats');
+    const res = await fetch(API + '/api/cohort-stats');
     const s = await res.json();
 
-    document.getElementById('db-stat-patients').textContent = s.tables.patients;
-    document.getElementById('db-stat-analyses').textContent = s.tables.analyses;
-    document.getElementById('db-stat-treatments').textContent = s.tables.treatments;
-    document.getElementById('db-size-badge').textContent = 'SQLite: ' + s.db_size_mb + ' MB';
+    document.getElementById('cs-total').textContent = s.total_patients;
+    document.getElementById('cs-analyzed').textContent = s.analyzed;
+    document.getElementById('cs-avg-risk').textContent = s.avg_risk || '-';
+    document.getElementById('cs-avg-surv').textContent = s.avg_surv ? '%' + s.avg_surv : '-';
 
-    const fill = s.fill_rate;
-    const pct = fill.total > 0 ? Math.round((fill.age / fill.total) * 100) : 0;
-    const srcHtml = Object.entries(s.sources).map(([k,v]) => `<strong>${v}</strong> ${k}`).join(' · ');
-
-    document.getElementById('db-fill-info').innerHTML = `
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
-        <div>
-          <div style="color:var(--text-muted);margin-bottom:4px">Veri Doluluugu</div>
-          <div style="display:flex;gap:16px">
-            <span>Yas: <strong>${fill.age}/${fill.total}</strong></span>
-            <span>MGMT: <strong>${fill.mgmt}/${fill.total}</strong></span>
-            <span>Analiz: <strong>${fill.analyzed}/${fill.total}</strong></span>
-          </div>
-          <div style="margin-top:6px;height:6px;background:var(--border-light);border-radius:3px;overflow:hidden">
-            <div style="height:100%;width:${pct}%;background:var(--green);border-radius:3px"></div>
-          </div>
-          <div style="font-size:11px;color:var(--text-faint);margin-top:3px">Klinik veri doluluk orani: %${pct}</div>
-        </div>
-        <div>
-          <div style="color:var(--text-muted);margin-bottom:4px">Veri Kaynaklari</div>
-          <div>${srcHtml}</div>
-        </div>
-      </div>
-    `;
-  } catch (err) { console.error('DB stats error:', err); }
-}
-
-async function loadDBTable(table, btnEl) {
-  dbState.table = table;
-  dbState.offset = 0;
-
-  if (btnEl) {
-    document.querySelectorAll('.db-tab-btn').forEach(b => {
-      b.classList.remove('active');
-      b.classList.remove('btn-primary');
-      b.classList.add('btn-outline');
-    });
-    btnEl.classList.add('active');
-    btnEl.classList.remove('btn-outline');
-    btnEl.classList.add('btn-primary');
+    renderStatBars('cs-risk-chart', s.risk_dist, RISK_COLORS, RISK_LABELS);
+    renderStatBars('cs-age-chart', s.age_bins, {});
+    renderStatBars('cs-mgmt-chart', s.mgmt_dist, MGMT_COLORS);
+    renderStatBars('cs-idh1-chart', s.idh1_dist, IDH1_COLORS);
+  } catch (err) {
+    console.error('Cohort stats error:', err);
   }
-
-  await fetchDBPage();
 }
 
-async function fetchDBPage() {
+function renderStatBars(containerId, data, colorMap, labelMap) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const entries = Object.entries(data).filter(([, v]) => v > 0);
+  if (!entries.length) {
+    el.innerHTML = '<div class="empty" style="padding:24px 0"><p>Henuz veri yok</p></div>';
+    return;
+  }
+  const total = entries.reduce((s, [, v]) => s + v, 0);
+  entries.sort((a, b) => b[1] - a[1]);
+  el.innerHTML = entries.map(([label, count]) => {
+    const pct = Math.round(count / total * 100);
+    const color = colorMap[label] || 'var(--blue)';
+    const displayLabel = (labelMap && labelMap[label]) || label;
+    return `
+      <div style="margin-bottom:14px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px">
+          <span style="font-weight:600;color:var(--text)">${esc(displayLabel)}</span>
+          <span style="color:var(--text-muted)">${count} hasta &middot; %${pct}</span>
+        </div>
+        <div style="height:10px;background:var(--border-light);border-radius:5px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:${color};border-radius:5px;transition:width .6s ease"></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+/* ── Hasta Zaman Çizelgesi ───────────────────────────────── */
+
+async function loadTimeline(patientId) {
+  const container = document.getElementById('report-timeline-container');
+  if (!container) return;
   try {
-    const res = await fetch(`${API}/api/db/table/${dbState.table}?limit=${dbState.limit}&offset=${dbState.offset}`);
+    const res = await fetch(API + '/api/patients/' + encodeURIComponent(patientId) + '/timeline');
     const data = await res.json();
-    dbState.total = data.total;
-
-    document.getElementById('db-table-info').textContent = `${data.total} satir · ${dbState.table}`;
-
-    const thead = document.getElementById('db-table-head');
-    const tbody = document.getElementById('db-table-body');
-
-    if (!data.rows || data.rows.length === 0) {
-      thead.innerHTML = '';
-      tbody.innerHTML = '<tr><td style="padding:20px;text-align:center;color:var(--text-muted)">Bu tabloda kayit yok</td></tr>';
-    } else {
-      const cols = Object.keys(data.rows[0]);
-      thead.innerHTML = '<tr>' + cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr>';
-      tbody.innerHTML = data.rows.map(row => {
-        return '<tr>' + cols.map(c => {
-          let val = row[c];
-          if (val === null || val === undefined) val = '<span style="color:var(--text-faint)">NULL</span>';
-          else if (typeof val === 'string' && val.length > 60) val = esc(val.substring(0, 60)) + '...';
-          else val = esc(String(val));
-          return `<td style="font-size:12px;white-space:nowrap">${val}</td>`;
-        }).join('') + '</tr>';
-      }).join('');
-    }
-
-    const pageNum = Math.floor(dbState.offset / dbState.limit) + 1;
-    const totalPages = Math.ceil(dbState.total / dbState.limit);
-    document.getElementById('db-page-info').textContent = `Sayfa ${pageNum} / ${totalPages}`;
-    document.getElementById('db-prev-btn').disabled = dbState.offset === 0;
-    document.getElementById('db-next-btn').disabled = dbState.offset + dbState.limit >= dbState.total;
-
-  } catch (err) { console.error('DB table error:', err); }
-}
-
-function dbPagePrev() {
-  dbState.offset = Math.max(0, dbState.offset - dbState.limit);
-  fetchDBPage();
-}
-
-function dbPageNext() {
-  if (dbState.offset + dbState.limit < dbState.total) {
-    dbState.offset += dbState.limit;
-    fetchDBPage();
+    renderTimeline(data.timeline || []);
+  } catch (err) {
+    container.innerHTML = '';
   }
+}
+
+function renderTimeline(timeline) {
+  const container = document.getElementById('report-timeline-container');
+  if (!container || timeline.length < 2) {
+    if (container) container.innerHTML = '';
+    return;
+  }
+  const items = timeline.map((t, i) => {
+    const riskColor = RISK_COLORS[t.risk_class] || 'var(--blue)';
+    return `
+      <div class="tl-item">
+        <div class="tl-dot" style="background:${riskColor}"></div>
+        ${i < timeline.length - 1 ? '<div class="tl-line"></div>' : ''}
+        <div class="tl-card">
+          <div class="tl-date">${esc(t.created_at)}</div>
+          <div class="tl-risk" style="color:${riskColor}">Risk ${t.risk_score != null ? Math.round(t.risk_score) : '-'}/100</div>
+          <div class="tl-detail">
+            ${t.tumor_volume_cm3 ? t.tumor_volume_cm3.toFixed(1) + ' cm³' : ''}
+            ${t.survival_6m_pct != null ? ' · %' + Math.round(t.survival_6m_pct) + ' sagkalim' : ''}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  container.innerHTML = `
+    <div class="card" style="margin-top:12px">
+      <div class="section-head">
+        <div class="section-title">HASTALIK SEYRI</div>
+        <span class="section-badge">${timeline.length} analiz</span>
+      </div>
+      <div class="card-body">
+        <div class="tl-wrap">${items}</div>
+      </div>
+    </div>`;
 }
