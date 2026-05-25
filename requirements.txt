@@ -9,3 +9,9 @@ scipy
 sqlalchemy
 python-dotenv
 anthropic
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+reportlab>=4.0
+pydicom>=2.4
+dicom2nifti>=2.4

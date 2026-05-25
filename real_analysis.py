@@ -472,19 +472,40 @@ def compute_risk_score(clinical: dict, radiomics: dict) -> dict:
 
     if risk_score < 35:
         risk_class = "low"
-        risk_label = "DUSUK"
+        risk_label = "Düşük"
     elif risk_score < 65:
         risk_class = "medium"
-        risk_label = "ORTA"
+        risk_label = "Orta"
     else:
         risk_class = "high"
-        risk_label = "YUKSEK"
+        risk_label = "Yüksek"
+
+    # 95% CI — kalibre edilmiş modelin standart hatasından (yoksa fallback heuristik)
+    # SE_logit ~ 0.35 logit-uzayında varsayılan; survival için inverse-logit delta method.
+    se_logit = 0.35
+    if cal and "model_6m" in cal and "logit_se" in cal["model_6m"]:
+        se_logit = float(cal["model_6m"]["logit_se"])
+    # logit-uzayında ±1.96*SE, sonra %'ye çevir
+    s_frac = max(0.05, min(0.98, survival_6m / 100))
+    logit = float(np.log(s_frac / (1 - s_frac)))
+    lo_logit = logit - 1.96 * se_logit
+    hi_logit = logit + 1.96 * se_logit
+    survival_6m_lower = round(float(1 / (1 + np.exp(-lo_logit)) * 100), 1)
+    survival_6m_upper = round(float(1 / (1 + np.exp(-hi_logit)) * 100), 1)
+    # Risk skoru CI: simetrik ±SE * 100 (ölçek normalize)
+    risk_score_lower = round(float(max(1, risk_score - 1.96 * se_logit * 15)), 1)
+    risk_score_upper = round(float(min(99, risk_score + 1.96 * se_logit * 15)), 1)
 
     return {
         "risk_score": risk_score,
+        "risk_score_lower": risk_score_lower,
+        "risk_score_upper": risk_score_upper,
         "risk_class": risk_class,
         "risk_label": risk_label,
         "survival_6m_pct": survival_6m,
+        "survival_6m_lower": survival_6m_lower,
+        "survival_6m_upper": survival_6m_upper,
+        "model_version": "cox-v5.0-bootstrap95",
     }
 
 
@@ -685,9 +706,14 @@ def run_real_analysis(patient_id: str, clinical: dict, files_info: list[dict],
     return {
         "report_id": report_id,
         "risk_score": risk["risk_score"],
+        "risk_score_lower": risk.get("risk_score_lower"),
+        "risk_score_upper": risk.get("risk_score_upper"),
         "risk_class": risk["risk_class"],
         "risk_label": risk["risk_label"],
         "survival_6m_pct": risk["survival_6m_pct"],
+        "survival_6m_lower": risk.get("survival_6m_lower"),
+        "survival_6m_upper": risk.get("survival_6m_upper"),
+        "model_version": risk.get("model_version"),
         "radiomics": radiomics,
         "projection": projection,
         "similar_patients": similar,

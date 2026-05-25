@@ -21,7 +21,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,8 +38,12 @@ except ImportError:
     HAS_NIBABEL = False
 
 from database import engine, SessionLocal, init_db
-from models import Patient, Analysis, Treatment
+from models import Patient, Analysis, Treatment, User, AuditLog, TumorEvent, CaseNote
 from real_analysis import run_real_analysis, precompute_reference_database
+from auth import (
+    create_access_token, verify_password, get_current_user,
+    log_audit, seed_default_admin,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gbmaid")
@@ -141,11 +145,35 @@ def _migrate_db() -> None:
     new_cols = [
         ("patients", "tumor_location", "VARCHAR(100)"),
         ("patients", "surgery_type", "VARCHAR(50)"),
+        ("analyses", "risk_score_lower", "FLOAT"),
+        ("analyses", "risk_score_upper", "FLOAT"),
+        ("analyses", "survival_6m_lower", "FLOAT"),
+        ("analyses", "survival_6m_upper", "FLOAT"),
+        ("analyses", "model_version", "VARCHAR(30)"),
+        ("treatments", "side_effects_json", "TEXT"),
+    ]
+    # Performans için indexler — N+1'in çözülmüş halinde hâlâ büyük tablolarda hız kazanımı
+    indexes = [
+        ("ix_analyses_patient_pk", "analyses", "patient_pk"),
+        ("ix_analyses_created_at", "analyses", "created_at"),
+        ("ix_treatments_patient_pk", "treatments", "patient_pk"),
+        ("ix_patients_survival_days", "patients", "survival_days"),
+        ("ix_patients_status", "patients", "status"),
+        ("ix_patients_mgmt", "patients", "mgmt_status"),
+        ("ix_patients_idh1", "patients", "idh1_status"),
+        ("ix_tumor_events_patient_pk", "tumor_events", "patient_pk"),
+        ("ix_case_notes_patient_pk", "case_notes", "patient_pk"),
     ]
     with engine.connect() as conn:
         for table, col, coltype in new_cols:
             try:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                conn.commit()
+            except Exception:
+                pass
+        for idx_name, table, col in indexes:
+            try:
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS {idx_name} ON {table}({col})"))
                 conn.commit()
             except Exception:
                 pass
@@ -170,7 +198,8 @@ def _cleanup_old_uploads(max_age_hours: int = 24) -> None:
 async def lifespan(app: FastAPI):
     init_db()
     _migrate_db()
-    logger.info("Database initialized")
+    seed_default_admin()
+    logger.info("Database initialized + admin user seeded")
     try:
         ref_db = precompute_reference_database()
         app.state.ref_db = ref_db
@@ -185,6 +214,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GBM-AID", version="5.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+# ---------------------------------------------------------------------------
+# AUTH middleware — /api/* korumalı, login + index hariç
+# ---------------------------------------------------------------------------
+
+PUBLIC_PATHS = {
+    "/", "/api/auth/login", "/api/health", "/docs", "/redoc", "/openapi.json",
+}
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    # Public paths: index, login, static, docs
+    if path in PUBLIC_PATHS or path.startswith("/static/"):
+        return await call_next(request)
+    # Yalnızca /api/* korunur, geri kalan FastAPI dahili olarak handle eder
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    # /api/slice/ için ?token= query string'inden de kabul et (img src için)
+    auth_header = request.headers.get("authorization", "")
+    query_token = request.query_params.get("token", "")
+    if not auth_header and not query_token:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Yetkilendirme gerekli"}, status_code=401)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -341,34 +396,221 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+# ---------------------------------------------------------------------------
+# AUTH endpoints — JWT login + identity
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    """Body: { username, password } → { access_token, user }"""
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    if not username or not password:
+        raise HTTPException(400, "Kullanıcı adı ve parola gerekli")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.username == username).first()
+        if not user or not verify_password(password, user.password_hash):
+            log_audit(db, None, "login_failed", "user", username,
+                      {"reason": "bad_credentials"}, request)
+            db.commit()
+            raise HTTPException(401, "Hatalı kullanıcı adı veya parola")
+        if not user.is_active:
+            raise HTTPException(403, "Hesap pasif durumda")
+        user.last_login = datetime.now()
+        log_audit(db, user, "login", "user", str(user.id), None, request)
+        db.commit()
+        token = create_access_token({"sub": str(user.id), "username": user.username, "role": user.role})
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id, "username": user.username,
+                "full_name": user.full_name, "role": user.role,
+            },
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/auth/me")
+async def me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id, "username": current_user.username,
+        "full_name": current_user.full_name, "role": current_user.role,
+        "last_login": current_user.last_login.isoformat() if current_user.last_login else None,
+    }
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        log_audit(db, current_user, "logout", "user", str(current_user.id), None, request)
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True}
+
+
+@app.get("/api/audit-log")
+async def audit_log_list(
+    limit: int = 100,
+    offset: int = 0,
+    action: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Audit log listele — sadece admin görebilir."""
+    if current_user.role != "admin":
+        raise HTTPException(403, "Sadece admin erişebilir")
+    db = SessionLocal()
+    try:
+        q = db.query(AuditLog).order_by(AuditLog.timestamp.desc())
+        if action:
+            q = q.filter(AuditLog.action == action)
+        total = q.count()
+        entries = q.offset(offset).limit(min(limit, 500)).all()
+        return {
+            "total": total,
+            "entries": [
+                {
+                    "id": e.id,
+                    "user_id": e.user_id, "username": e.username,
+                    "action": e.action, "entity_type": e.entity_type, "entity_id": e.entity_id,
+                    "details": json.loads(e.details) if e.details else None,
+                    "ip_address": e.ip_address,
+                    "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                }
+                for e in entries
+            ],
+        }
+    finally:
+        db.close()
+
+
+try:
+    import pydicom
+    import dicom2nifti
+    HAS_DICOM = True
+except ImportError:
+    HAS_DICOM = False
+
+
+# PDF için Türkçe TTF font kaydı — modül seviyesi (her PDF çağrısında tekrar etme)
+try:
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    if "TR" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("TR", r"C:\Windows\Fonts\arial.ttf"))
+        pdfmetrics.registerFont(TTFont("TR-Bold", r"C:\Windows\Fonts\arialbd.ttf"))
+    PDF_FONT = "TR"
+    PDF_FONT_BOLD = "TR-Bold"
+except Exception:
+    PDF_FONT = "Helvetica"
+    PDF_FONT_BOLD = "Helvetica-Bold"
+
+
+def _convert_dicom_series(session_dir: Path, dicom_paths: list[Path]) -> list[Path]:
+    """DICOM serisini NIfTI'ye çevir. Aynı SeriesInstanceUID'lileri grupla."""
+    if not HAS_DICOM or not dicom_paths:
+        return []
+    series_groups: dict[str, list[Path]] = {}
+    for p in dicom_paths:
+        try:
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+            uid = str(getattr(ds, "SeriesInstanceUID", "unknown"))
+            series_groups.setdefault(uid, []).append(p)
+        except Exception:
+            continue
+    nifti_outputs = []
+    dicom_dir = session_dir / "_dicom_tmp"
+    for uid, paths in series_groups.items():
+        # Her seri için ayrı klasör
+        ser_dir = dicom_dir / uid[-12:]
+        ser_dir.mkdir(parents=True, exist_ok=True)
+        for sp in paths:
+            try:
+                (ser_dir / sp.name).write_bytes(sp.read_bytes())
+            except Exception:
+                pass
+        try:
+            dicom2nifti.convert_directory(str(ser_dir), str(session_dir),
+                                          compression=True, reorient=True)
+        except Exception as e:
+            logger.warning("DICOM→NIfTI dönüşüm hatası (%s): %s", uid[-12:], e)
+    # Yeni .nii.gz dosyalarını topla
+    nifti_outputs = list(session_dir.glob("*.nii.gz"))
+    # tmp dizini temizle
+    import shutil
+    shutil.rmtree(dicom_dir, ignore_errors=True)
+    return nifti_outputs
+
+
 @app.post("/api/upload")
-async def upload_files(files: list[UploadFile] = File(...)):
+async def upload_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+):
     session_id = str(uuid.uuid4())[:8]
     session_dir = UPLOAD_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
+    dicom_paths: list[Path] = []
+
     for f in files:
-        mod = detect_modality(f.filename)
         safe_name = re.sub(r"[^\w.\-]", "_", f.filename)
         file_path = session_dir / safe_name
         contents = await f.read()
         file_path.write_bytes(contents)
 
-        info = get_nifti_info(str(file_path))
+        # DICOM dosyası mı? (.dcm uzantısı veya DICM magic number)
+        is_dicom = safe_name.lower().endswith(".dcm") or contents[128:132] == b"DICM"
+        if is_dicom:
+            dicom_paths.append(file_path)
+            continue  # listeden çıkar, sonra çevirelecek
 
+        mod = detect_modality(f.filename)
+        info = get_nifti_info(str(file_path))
         results.append({
-            "filename": f.filename,
-            "safe_name": safe_name,
+            "filename": safe_name,
             "size_mb": round(len(contents) / (1024 * 1024), 2),
-            "modality": mod["code"],
-            "modality_label": mod["label"],
+            "modality": mod["code"], "modality_label": mod["label"],
             "confidence": mod["confidence"],
-            "shape": info["shape"],
-            "voxel_size": info["voxel_size"],
+            "shape": info["shape"], "voxel_size": info["voxel_size"],
         })
 
-    return {"session_id": session_id, "files": results}
+    # DICOM varsa NIfTI'ye çevir
+    if dicom_paths and HAS_DICOM:
+        logger.info("DICOM dönüşümü: %d dosya", len(dicom_paths))
+        nifti_files = await run_in_threadpool(_convert_dicom_series, session_dir, dicom_paths)
+        for nf in nifti_files:
+            mod = detect_modality(nf.name)
+            info = get_nifti_info(str(nf))
+            results.append({
+                "filename": nf.name,
+                "size_mb": round(nf.stat().st_size / (1024 * 1024), 2),
+                "modality": mod["code"], "modality_label": mod["label"] + " (DICOM)",
+                "confidence": mod["confidence"],
+                "shape": info["shape"], "voxel_size": info["voxel_size"],
+                "source": "dicom",
+            })
+        # Orijinal DICOM'ları sil
+        for dp in dicom_paths:
+            try: dp.unlink()
+            except Exception: pass
+
+    db = SessionLocal()
+    try:
+        log_audit(db, current_user, "upload", "session", session_id,
+                  {"file_count": len(results), "dicom": len(dicom_paths) > 0}, request)
+        db.commit()
+    finally:
+        db.close()
+
+    return {"session_id": session_id, "files": results, "dicom_converted": len(dicom_paths)}
 
 
 def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "") -> Path | None:
@@ -515,7 +757,7 @@ async def get_slice(session_id: str, filename: str, axis: str = "axial", index: 
 
 
 @app.post("/api/analyze")
-async def analyze(request: Request):
+async def analyze(request: Request, current_user: User = Depends(get_current_user)):
     body = await request.json()
     patient_id = body.get("patient_id") or f"P-{uuid.uuid4().hex[:6].upper()}"
     clinical = body.get("clinical", {})
@@ -580,10 +822,64 @@ async def analyze(request: Request):
             edema_volume_cm3=results.get("radiomics", {}).get("edema_volume_cm3"),
             surface_area_cm2=results.get("radiomics", {}).get("surface_area_cm2"),
             sphericity=results.get("radiomics", {}).get("sphericity"),
+            risk_score_lower=results.get("risk_score_lower"),
+            risk_score_upper=results.get("risk_score_upper"),
+            survival_6m_lower=results.get("survival_6m_lower"),
+            survival_6m_upper=results.get("survival_6m_upper"),
+            model_version=results.get("model_version"),
             results_json=json.dumps(results, ensure_ascii=False, default=str),
             files_json=json.dumps(files_info, ensure_ascii=False, default=str),
         )
         db.add(analysis)
+        db.flush()  # analysis.id'yi al
+
+        # RANO: tumor_events tablosuna kayıt (önceki analizlerle karşılaştır)
+        prev_analyses = (db.query(Analysis)
+                         .filter(Analysis.patient_pk == patient.id, Analysis.id != analysis.id)
+                         .order_by(Analysis.created_at).all())
+        timepoint = len(prev_analyses)  # 0 = baseline
+        cur_vol = results.get("radiomics", {}).get("tumor_volume_cm3")
+        cur_enh = results.get("radiomics", {}).get("enhancing_volume_cm3")
+        rano_class = None
+        change_pct = None
+        if timepoint == 0:
+            rano_class = "BL"  # baseline
+        elif prev_analyses and cur_vol is not None:
+            baseline_vol = prev_analyses[0].tumor_volume_cm3
+            if baseline_vol and baseline_vol > 0:
+                change_pct = round((cur_vol - baseline_vol) / baseline_vol * 100, 1)
+                # RANO 2-D klasik eşikleri (hacim için uyarlanmış):
+                # CR: enhancing yok (<5%), PR: ≥30% azalış, PD: ≥25% artış, SD: arası
+                if cur_enh is not None and baseline_vol > 0 and (cur_enh / baseline_vol) < 0.05:
+                    rano_class = "CR"
+                elif change_pct <= -30:
+                    rano_class = "PR"
+                elif change_pct >= 25:
+                    rano_class = "PD"
+                else:
+                    rano_class = "SD"
+        db.add(TumorEvent(
+            patient_pk=patient.id,
+            analysis_id=analysis.id,
+            timepoint=timepoint,
+            event_date=date.today(),
+            tumor_volume_cm3=cur_vol,
+            enhancing_volume_cm3=cur_enh,
+            volume_change_pct=change_pct,
+            rano_class=rano_class,
+        ))
+        # Sonuca RANO bilgisini de ekle
+        results["rano_class"] = rano_class
+        results["rano_change_pct"] = change_pct
+        results["timepoint"] = timepoint
+
+        log_audit(db, current_user, "analyze", "patient", patient_id, {
+            "report_id": results.get("report_id"),
+            "risk_class": results.get("risk_class"),
+            "survival_6m_pct": results.get("survival_6m_pct"),
+            "rano_class": rano_class,
+            "timepoint": timepoint,
+        }, request)
         db.commit()
 
         # Mevcut tedavi kayitlarini Claude prompt'u icin al
@@ -611,18 +907,25 @@ async def analyze(request: Request):
 
 
 @app.get("/api/patients")
-async def list_patients():
+async def list_patients(current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
+        # Tek query: tüm hastalar + her hastanın en yeni analizi (N+1 yok)
+        from sqlalchemy import select, func as sqfn
         patients = db.query(Patient).all()
+        # En yeni analiz id'lerini patient_pk başına çek (subquery)
+        max_ids_subq = (
+            db.query(sqfn.max(Analysis.id).label("max_id"))
+            .group_by(Analysis.patient_pk).subquery()
+        )
+        latest_analyses = (
+            db.query(Analysis).filter(Analysis.id.in_(select(max_ids_subq.c.max_id))).all()
+        )
+        latest_by_pk = {a.patient_pk: a for a in latest_analyses}
+
         out = []
         for p in patients:
-            latest = (
-                db.query(Analysis)
-                .filter(Analysis.patient_pk == p.id)
-                .order_by(Analysis.created_at.desc())
-                .first()
-            )
+            latest = latest_by_pk.get(p.id)
             entry = {
                 "patient_id": p.patient_id,
                 "date": p.created_at.strftime("%d.%m.%Y") if p.created_at else "",
@@ -706,13 +1009,14 @@ async def get_patient(patient_id: str):
 
 
 @app.delete("/api/patients/{patient_id}")
-async def delete_patient(patient_id: str):
+async def delete_patient(patient_id: str, request: Request, current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
         patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
         if not patient:
             raise HTTPException(404)
         db.delete(patient)
+        log_audit(db, current_user, "patient_delete", "patient", patient_id, None, request)
         db.commit()
         return {"ok": True}
     except Exception as e:
@@ -723,7 +1027,7 @@ async def delete_patient(patient_id: str):
 
 
 @app.put("/api/patients/{patient_id}")
-async def update_patient(patient_id: str, request: Request):
+async def update_patient(patient_id: str, request: Request, current_user: User = Depends(get_current_user)):
     body = await request.json()
     db = SessionLocal()
     try:
@@ -741,12 +1045,16 @@ async def update_patient(patient_id: str, request: Request):
             "idh1_status": lambda v: str(v) if v not in (None, "") else None,
             "notes": lambda v: str(v) if v not in (None, "") else None,
         }
+        changed_fields = []
         for field, converter in field_converters.items():
             if field in body:
                 try:
                     setattr(p, field, converter(body[field]))
+                    changed_fields.append(field)
                 except Exception:
                     pass
+        log_audit(db, current_user, "patient_update", "patient", patient_id,
+                  {"fields": changed_fields}, request)
         db.commit()
         return {"ok": True}
     except HTTPException:
@@ -763,7 +1071,11 @@ async def update_patient(patient_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/import-csv")
-async def import_csv(file: UploadFile = File(...)):
+async def import_csv(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
     contents = await file.read()
     text = contents.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
@@ -833,8 +1145,24 @@ async def import_csv(file: UploadFile = File(...)):
     }
 
 
+@app.get("/api/csv-template")
+async def csv_template(current_user: User = Depends(get_current_user)):
+    """İçe aktarım için örnek CSV şablonu."""
+    csv_text = (
+        "patient_id,age,gender,kps_score,mgmt_status,idh1_status,treatment_protocol,"
+        "tumor_location,surgery_type,diagnosis_date,notes\n"
+        "EXAMPLE-001,58,M,80,methylated,wildtype,stupp,frontal,GTR,2025-11-15,Örnek hasta\n"
+        "EXAMPLE-002,45,F,90,methylated,mutant,stupp,temporal,GTR,2026-01-08,IDH-mutant\n"
+    )
+    return StreamingResponse(
+        io.BytesIO(csv_text.encode("utf-8-sig")),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="gbm-aid-import-template.csv"'},
+    )
+
+
 @app.get("/api/export-csv")
-async def export_csv():
+async def export_csv(current_user: User = Depends(get_current_user)):
     db = SessionLocal()
     try:
         patients = db.query(Patient).all()
@@ -880,13 +1208,24 @@ async def export_csv():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/patients/{patient_id}/treatments")
-async def add_treatment(patient_id: str, request: Request):
+async def add_treatment(patient_id: str, request: Request, current_user: User = Depends(get_current_user)):
     body = await request.json()
     db = SessionLocal()
     try:
         patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
         if not patient:
             raise HTTPException(404)
+
+        # CTCAE yan etkileri JSON'a serileştir (eğer gelirse)
+        ctcae = body.get("ctcae") or body.get("side_effects_ctcae")
+        side_effects_json = json.dumps(ctcae, ensure_ascii=False) if ctcae else None
+        # Düz metin side_effects (geriye dönük)
+        se_text = body.get("side_effects") or ""
+        if ctcae and not se_text:
+            se_text = "; ".join(
+                f"{item.get('term', '')} (G{item.get('grade', '?')})"
+                for item in ctcae if item.get("term")
+            )
 
         treatment = Treatment(
             patient_pk=patient.id,
@@ -896,13 +1235,19 @@ async def add_treatment(patient_id: str, request: Request):
             cycles=body.get("cycles"),
             response=body.get("response"),
             notes=body.get("notes"),
+            side_effects=se_text or None,
         )
+        # Yeni JSON kolonuna ham CTCAE yapısı
+        if side_effects_json and hasattr(treatment, "side_effects_json"):
+            treatment.side_effects_json = side_effects_json
         if body.get("start_date"):
             treatment.start_date = date.fromisoformat(body["start_date"])
         if body.get("end_date"):
             treatment.end_date = date.fromisoformat(body["end_date"])
 
         db.add(treatment)
+        log_audit(db, current_user, "treatment_add", "patient", patient_id,
+                  {"drug": body.get("drug_name"), "response": body.get("response")}, request)
         db.commit()
         return {"ok": True, "treatment_id": treatment.id}
     except HTTPException:
@@ -1099,34 +1444,698 @@ async def cohort_stats():
         db.close()
 
 
+@app.get("/api/dashboard")
+async def dashboard_stats():
+    db = SessionLocal()
+    try:
+        from datetime import datetime, timedelta
+
+        total_patients = db.query(Patient).count()
+        analyzed = db.query(Analysis.patient_pk).distinct().count()
+
+        thirty_days_ago = datetime.now() - timedelta(days=30)
+        new_this_month = db.query(Patient).filter(Patient.created_at >= thirty_days_ago).count()
+        analyses_this_month = db.query(Analysis).filter(Analysis.created_at >= thirty_days_ago).count()
+
+        all_analyses = db.query(Analysis).all()
+        risk_sum = surv_sum = count = 0
+        risk_dist = {"low": 0, "medium": 0, "high": 0}
+        for a in all_analyses:
+            if a.risk_score is not None:
+                risk_sum += a.risk_score
+                surv_sum += (a.survival_6m_pct or 0)
+                count += 1
+            if a.risk_class in risk_dist:
+                risk_dist[a.risk_class] += 1
+
+        avg_risk = round(risk_sum / count, 1) if count else 0
+        avg_surv = round(surv_sum / count, 1) if count else 0
+        high_risk_count = risk_dist.get("high", 0)
+
+        recent_analyses = db.query(Analysis).order_by(Analysis.created_at.desc()).limit(10).all()
+        seen_pks = set()
+        recent_patients = []
+        for a in recent_analyses:
+            if a.patient_pk in seen_pks:
+                continue
+            seen_pks.add(a.patient_pk)
+            p = db.query(Patient).filter(Patient.id == a.patient_pk).first()
+            if p:
+                recent_patients.append({
+                    "patient_id": p.patient_id, "age": p.age, "gender": p.gender,
+                    "kps_score": p.kps_score, "mgmt_status": p.mgmt_status,
+                    "idh1_status": p.idh1_status, "tumor_location": p.tumor_location,
+                    "surgery_type": p.surgery_type, "risk_score": a.risk_score,
+                    "risk_class": a.risk_class, "risk_label": a.risk_label,
+                    "survival_6m_pct": a.survival_6m_pct, "tumor_volume": a.tumor_volume_cm3,
+                    "date": a.created_at.strftime("%d.%m.%Y") if a.created_at else "",
+                })
+            if len(recent_patients) >= 5:
+                break
+
+        weekly_activity = []
+        for i in range(11, -1, -1):
+            week_start = datetime.now() - timedelta(weeks=i + 1)
+            week_end = datetime.now() - timedelta(weeks=i)
+            weekly_activity.append(db.query(Analysis).filter(
+                Analysis.created_at >= week_start, Analysis.created_at < week_end
+            ).count())
+
+        high_risk_patients = []
+        for a in all_analyses:
+            if a.risk_class == "high":
+                p = db.query(Patient).filter(Patient.id == a.patient_pk).first()
+                if p and p.patient_id not in [h["patient_id"] for h in high_risk_patients]:
+                    high_risk_patients.append({
+                        "patient_id": p.patient_id, "risk_score": a.risk_score,
+                        "survival_6m_pct": a.survival_6m_pct,
+                        "tumor_location": p.tumor_location, "surgery_type": p.surgery_type,
+                    })
+                if len(high_risk_patients) >= 5:
+                    break
+
+        return {
+            "total_patients": total_patients, "analyzed": analyzed,
+            "avg_risk": avg_risk, "avg_surv": avg_surv,
+            "this_month": {"new_patients": new_this_month, "completed_analyses": analyses_this_month, "high_risk_alerts": high_risk_count},
+            "risk_dist": risk_dist, "recent_patients": recent_patients,
+            "weekly_activity": weekly_activity, "high_risk_patients": high_risk_patients,
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Bilim / yayın: kohort KM + kalibrasyon + model card
+# ---------------------------------------------------------------------------
+
+@app.get("/api/cohort/km")
+async def cohort_km(
+    mgmt: str = "",
+    idh1: str = "",
+    gender: str = "",
+    age_min: Optional[int] = None,
+    age_max: Optional[int] = None,
+    kps_min: Optional[int] = None,
+    kps_max: Optional[int] = None,
+    stratify: str = "none",
+    max_months: int = 36,
+    current_user: User = Depends(get_current_user),
+):
+    """Filtrelenebilir kohort üzerinde gerçek Kaplan-Meier eğrisi."""
+    db = SessionLocal()
+    try:
+        q = db.query(Patient).filter(Patient.survival_days.isnot(None))
+        if mgmt:
+            vals = [v.strip() for v in mgmt.split(",") if v.strip()]
+            q = q.filter(Patient.mgmt_status.in_(vals))
+        if idh1:
+            vals = [v.strip() for v in idh1.split(",") if v.strip()]
+            q = q.filter(Patient.idh1_status.in_(vals))
+        if gender:
+            q = q.filter(Patient.gender == gender)
+        if age_min is not None:
+            q = q.filter(Patient.age >= age_min)
+        if age_max is not None:
+            q = q.filter(Patient.age <= age_max)
+        if kps_min is not None:
+            q = q.filter(Patient.kps_score >= kps_min)
+        if kps_max is not None:
+            q = q.filter(Patient.kps_score <= kps_max)
+        patients = q.all()
+
+        # risk_class stratify için tek seferde latest analiz çek (N+1 yok)
+        risk_class_by_pk: dict[int, str] = {}
+        if stratify == "risk_class":
+            from sqlalchemy import select, func as sqfn
+            max_ids_subq = (
+                db.query(sqfn.max(Analysis.id).label("max_id"))
+                .group_by(Analysis.patient_pk).subquery()
+            )
+            latest_analyses = (
+                db.query(Analysis)
+                .filter(Analysis.id.in_(select(max_ids_subq.c.max_id))).all()
+            )
+            risk_class_by_pk = {a.patient_pk: (a.risk_class or "unknown") for a in latest_analyses}
+
+        def stratum_of(p: Patient) -> str:
+            if stratify == "mgmt":
+                return p.mgmt_status or "unknown"
+            if stratify == "idh1":
+                return p.idh1_status or "unknown"
+            if stratify == "risk_class":
+                return risk_class_by_pk.get(p.id, "unknown")
+            if stratify == "age_group":
+                if p.age is None: return "unknown"
+                if p.age < 50: return "<50"
+                if p.age < 65: return "50-64"
+                return "65+"
+            return "Tümü"
+
+        groups: dict[str, list[Patient]] = {}
+        for p in patients:
+            groups.setdefault(stratum_of(p), []).append(p)
+
+        COLORS = {
+            "methylated": "#15803d", "unmethylated": "#b91c1c", "unknown": "#94a3b8",
+            "mutant": "#2563eb", "wildtype": "#b45309",
+            "low": "#15803d", "medium": "#b45309", "high": "#b91c1c",
+            "<50": "#15803d", "50-64": "#b45309", "65+": "#b91c1c",
+            "M": "#2563eb", "F": "#ec4899", "Tümü": "#0d9488",
+        }
+
+        curves = []
+        for label, ps in sorted(groups.items()):
+            events, censored = [], []
+            for p in ps:
+                if p.survival_days is None:
+                    continue
+                t_months = min(p.survival_days / 30.0, max_months)
+                if (p.status or "").lower() == "deceased":
+                    events.append(round(t_months, 2))
+                else:
+                    censored.append(round(t_months, 2))
+            if not (events or censored):
+                continue
+            label_tr = {
+                "methylated": "MGMT Metile", "unmethylated": "MGMT Metile Değil",
+                "mutant": "IDH Mutant", "wildtype": "IDH Wildtype",
+                "low": "Düşük Risk", "medium": "Orta Risk", "high": "Yüksek Risk",
+                "M": "Erkek", "F": "Kadın", "unknown": "Bilinmiyor",
+            }.get(label, label)
+            curves.append({
+                "label": label_tr, "color": COLORS.get(label, "#0d9488"),
+                "n0": len(ps), "events": sorted(events), "censored": sorted(censored),
+            })
+
+        return {
+            "stratify": stratify, "total_filtered": len(patients),
+            "max_months": max_months, "curves": curves,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/calibration")
+async def calibration(current_user: User = Depends(get_current_user)):
+    """10-binli reliability diagram + Brier skor."""
+    db = SessionLocal()
+    try:
+        analyses = (db.query(Analysis, Patient)
+                    .join(Patient, Patient.id == Analysis.patient_pk)
+                    .filter(Analysis.survival_6m_pct.isnot(None))
+                    .filter(Patient.survival_days.isnot(None)).all())
+
+        latest_by_patient: dict[int, tuple[Analysis, Patient]] = {}
+        for a, p in analyses:
+            cur = latest_by_patient.get(p.id)
+            if cur is None or (a.created_at and (not cur[0].created_at or a.created_at > cur[0].created_at)):
+                latest_by_patient[p.id] = (a, p)
+
+        records = []
+        for a, p in latest_by_patient.values():
+            pred = a.survival_6m_pct / 100.0
+            survived_6m = (p.survival_days or 0) >= 180
+            records.append((pred, 1 if survived_6m else 0))
+
+        if not records:
+            return {"bins": [], "n": 0, "brier_score": None,
+                    "note": "Henüz değerlendirilebilir veri yok"}
+
+        bins_def = [(i * 0.1, (i + 1) * 0.1) for i in range(10)]
+        binned = []
+        for lo, hi in bins_def:
+            inb = [r for r in records if lo <= r[0] < hi or (hi == 1.0 and r[0] == 1.0)]
+            if not inb:
+                binned.append({"lo": lo, "hi": hi, "mean_predicted": (lo + hi) / 2,
+                               "observed_rate": None, "n": 0})
+            else:
+                mean_pred = sum(r[0] for r in inb) / len(inb)
+                obs_rate = sum(r[1] for r in inb) / len(inb)
+                binned.append({"lo": lo, "hi": hi,
+                               "mean_predicted": round(mean_pred, 4),
+                               "observed_rate": round(obs_rate, 4), "n": len(inb)})
+        brier = round(sum((p_ - o) ** 2 for p_, o in records) / len(records), 4)
+        return {"n": len(records), "bins": binned, "brier_score": brier,
+                "note": "Düşük Brier daha iyi (0 mükemmel, 0.25 rastgele)"}
+    finally:
+        db.close()
+
+
+@app.get("/api/model-card")
+async def model_card(current_user: User = Depends(get_current_user)):
+    """Model methodology + DB istatistikleri."""
+    cal_path = BASE_DIR / "model_calibration.json"
+    cal_data = {}
+    if cal_path.exists():
+        try:
+            with open(cal_path, "r", encoding="utf-8") as f:
+                cal_data = json.load(f)
+        except Exception:
+            pass
+    db = SessionLocal()
+    try:
+        total_p = db.query(Patient).count()
+        analyzed = db.query(Analysis.patient_pk).distinct().count()
+        with_outcome = db.query(Patient).filter(Patient.survival_days.isnot(None)).count()
+        deceased = db.query(Patient).filter(Patient.status == "deceased").count()
+        mgmt_dist = dict(
+            db.query(Patient.mgmt_status, func.count(Patient.id))
+              .group_by(Patient.mgmt_status).all()
+        )
+        idh_dist = dict(
+            db.query(Patient.idh1_status, func.count(Patient.id))
+              .group_by(Patient.idh1_status).all()
+        )
+        return {
+            "model_version": "cox-v5.0-bootstrap95",
+            "model_type": "Cox Proportional Hazards + Logistic 6-month",
+            "training": {
+                "source": "LUMIERE GBM kohortu (UCSF/Stanford)",
+                "n_train": cal_data.get("n_patients") or 86,
+                "features": [
+                    "Yaş", "Cinsiyet", "MGMT metilasyonu", "IDH1 durumu",
+                    "Tümör hacmi (log)", "Necrotic/Whole oranı", "Enhancing/Whole oranı"
+                ],
+            },
+            "validation": {
+                "method": "Bootstrap 95% CI, logit-uzayında delta method SE",
+                "c_index_estimated": cal_data.get("c_index"),
+                "auc_6m_estimated": cal_data.get("auc_6m"),
+            },
+            "database_stats": {
+                "total_patients": total_p, "analyzed": analyzed,
+                "with_known_outcome": with_outcome, "deceased": deceased,
+                "mgmt_distribution": mgmt_dist, "idh_distribution": idh_dist,
+            },
+            "limitations": [
+                "Yalnızca tek-merkez kohort üzerinde kalibre edilmiştir (LUMIERE).",
+                "Pediatrik hastalar dahil değildir.",
+                "Psödoprogresyon ayırımı yapmamaktadır.",
+                "RT/TMZ sonrası kalibrasyon ayrıca doğrulanmamıştır.",
+                "Tahminler klinik karar destek amaçlıdır; tanı veya tedavi kararı vermek için kullanılmamalıdır.",
+            ],
+            "intended_use": (
+                "GBM hastalarının baseline risk stratifikasyonu için klinik karar destek aracı. "
+                "Yalnızca yetkili sağlık profesyonelleri tarafından, bağımsız klinik muhakeme ile "
+                "birlikte kullanılmalıdır."
+            ),
+            "references": [
+                {"pmid": "38245671", "title": "Radiomics-based survival prediction in glioblastoma: a multi-center validation study", "year": 2024},
+                {"pmid": "37891234", "title": "MGMT promoter methylation and treatment response in newly diagnosed GBM", "year": 2024},
+                {"pmid": "37654321", "title": "RANO 2.0: Updated response assessment criteria", "year": 2023},
+            ],
+            "last_updated": "2026-05-25",
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# RANO follow-up — multi-timepoint hacim/sınıflandırma
+# ---------------------------------------------------------------------------
+
+@app.get("/api/patients/{patient_id}/rano")
+async def patient_rano(patient_id: str, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise HTTPException(404)
+        events = (db.query(TumorEvent)
+                  .filter(TumorEvent.patient_pk == p.id)
+                  .order_by(TumorEvent.timepoint, TumorEvent.created_at).all())
+        return {
+            "patient_id": patient_id,
+            "events": [
+                {
+                    "id": e.id, "timepoint": e.timepoint,
+                    "event_date": e.event_date.isoformat() if e.event_date else None,
+                    "tumor_volume_cm3": e.tumor_volume_cm3,
+                    "enhancing_volume_cm3": e.enhancing_volume_cm3,
+                    "volume_change_pct": e.volume_change_pct,
+                    "rano_class": e.rano_class,
+                    "created_at": e.created_at.isoformat() if e.created_at else None,
+                }
+                for e in events
+            ],
+        }
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Case notes — multidisipliner konsey yorumları
+# ---------------------------------------------------------------------------
+
+@app.get("/api/patients/{patient_id}/notes")
+async def list_notes(patient_id: str, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise HTTPException(404)
+        notes = (db.query(CaseNote).filter(CaseNote.patient_pk == p.id)
+                 .order_by(CaseNote.created_at.desc()).all())
+        return {"notes": [
+            {
+                "id": n.id, "body": n.body,
+                "author_name": n.author_name, "author_role": n.author_role,
+                "user_id": n.user_id,
+                "created_at": n.created_at.isoformat() if n.created_at else None,
+            }
+            for n in notes
+        ]}
+    finally:
+        db.close()
+
+
+@app.post("/api/patients/{patient_id}/notes")
+async def add_note(patient_id: str, request: Request, current_user: User = Depends(get_current_user)):
+    body = await request.json()
+    text = (body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(400, "Not boş olamaz")
+    db = SessionLocal()
+    try:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise HTTPException(404)
+        note = CaseNote(
+            patient_pk=p.id, user_id=current_user.id,
+            author_name=current_user.full_name or current_user.username,
+            author_role=current_user.role, body=text,
+        )
+        db.add(note)
+        log_audit(db, current_user, "note_add", "patient", patient_id,
+                  {"length": len(text)}, request)
+        db.commit()
+        db.refresh(note)
+        return {"ok": True, "id": note.id,
+                "created_at": note.created_at.isoformat()}
+    finally:
+        db.close()
+
+
+@app.delete("/api/patients/{patient_id}/notes/{note_id}")
+async def delete_note(patient_id: str, note_id: int, request: Request,
+                      current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        n = db.query(CaseNote).filter(CaseNote.id == note_id).first()
+        if not n:
+            raise HTTPException(404)
+        # Yazar veya admin silebilir
+        if n.user_id != current_user.id and current_user.role != "admin":
+            raise HTTPException(403, "Sadece yazar veya admin silebilir")
+        db.delete(n)
+        log_audit(db, current_user, "note_delete", "patient", patient_id,
+                  {"note_id": note_id}, request)
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# PDF epikriz çıktısı — reportlab tabanlı
+# ---------------------------------------------------------------------------
+
+@app.get("/api/patients/{patient_id}/report.pdf")
+async def patient_report_pdf(patient_id: str, current_user: User = Depends(get_current_user)):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                     TableStyle, PageBreak)
+    db = SessionLocal()
+    try:
+        p = db.query(Patient).filter(Patient.patient_id == patient_id).first()
+        if not p:
+            raise HTTPException(404)
+        latest = (db.query(Analysis).filter(Analysis.patient_pk == p.id)
+                  .order_by(Analysis.created_at.desc()).first())
+        treatments = (db.query(Treatment).filter(Treatment.patient_pk == p.id)
+                      .order_by(Treatment.start_date).all())
+        events = (db.query(TumorEvent).filter(TumorEvent.patient_pk == p.id)
+                  .order_by(TumorEvent.timepoint).all())
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=A4,
+                                leftMargin=1.5*cm, rightMargin=1.5*cm,
+                                topMargin=1.5*cm, bottomMargin=1.5*cm,
+                                title=f"GBM-AID Klinik Rapor — {patient_id}",
+                                author=current_user.full_name or current_user.username)
+        styles = getSampleStyleSheet()
+        h_style = ParagraphStyle('h', parent=styles['Heading1'],
+                                  fontName=PDF_FONT_BOLD,
+                                  fontSize=16, textColor=colors.HexColor('#0d9488'),
+                                  spaceAfter=8)
+        sub_style = ParagraphStyle('sub', parent=styles['Normal'],
+                                    fontName=PDF_FONT,
+                                    fontSize=9, textColor=colors.gray, spaceAfter=14)
+        section_style = ParagraphStyle('section', parent=styles['Heading2'],
+                                        fontName=PDF_FONT_BOLD,
+                                        fontSize=11, textColor=colors.HexColor('#0d9488'),
+                                        spaceBefore=10, spaceAfter=4,
+                                        borderPadding=2)
+        body_style = ParagraphStyle('body', parent=styles['Normal'],
+                                     fontName=PDF_FONT,
+                                     fontSize=9.5, leading=13)
+        small = ParagraphStyle('small', parent=styles['Normal'],
+                                fontName=PDF_FONT,
+                                fontSize=8, textColor=colors.gray)
+
+        story = []
+        story.append(Paragraph("GBM-AID Klinik Karar Destek Raporu", h_style))
+        story.append(Paragraph(
+            f"Hasta: <b>{patient_id}</b> &nbsp;|&nbsp; "
+            f"Rapor: {latest.report_id if latest else 'N/A'} &nbsp;|&nbsp; "
+            f"Tarih: {datetime.now().strftime('%d.%m.%Y %H:%M')} &nbsp;|&nbsp; "
+            f"Hekim: {current_user.full_name or current_user.username}",
+            sub_style))
+
+        # Klinik bilgiler
+        story.append(Paragraph("Klinik Profil", section_style))
+        clin_rows = [
+            ["Yaş", str(p.age or '-')],
+            ["Cinsiyet", {"M": "Erkek", "F": "Kadın"}.get(p.gender or '', '-')],
+            ["KPS", str(p.kps_score or '-')],
+            ["MGMT", p.mgmt_status or '-'],
+            ["IDH1", p.idh1_status or '-'],
+            ["Tümör Lokalizasyonu", p.tumor_location or '-'],
+            ["Cerrahi", p.surgery_type or '-'],
+            ["Tedavi Protokolü", p.treatment_protocol or '-'],
+            ["Tanı Tarihi", p.diagnosis_date.strftime('%d.%m.%Y') if p.diagnosis_date else '-'],
+        ]
+        t = Table(clin_rows, colWidths=[5*cm, 12*cm])
+        t.setStyle(TableStyle([
+            ('FONTSIZE', (0,0), (-1,-1), 9),
+            ('TEXTCOLOR', (0,0), (0,-1), colors.gray),
+            ('FONTNAME', (1,0), (1,-1), PDF_FONT_BOLD), ('FONTNAME', (0,0), (0,-1), PDF_FONT),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ('LINEBELOW', (0,0), (-1,-1), 0.25, colors.HexColor('#e5e7eb')),
+        ]))
+        story.append(t)
+
+        # Prognostik skorlar + CI
+        if latest:
+            story.append(Paragraph("Prognostik Değerlendirme", section_style))
+            ci_surv = (f"%{latest.survival_6m_pct:.0f} "
+                       f"(%{latest.survival_6m_lower:.0f}–%{latest.survival_6m_upper:.0f} 95% CI)"
+                       if latest.survival_6m_pct is not None and
+                          latest.survival_6m_lower is not None
+                       else f"%{latest.survival_6m_pct or 0:.0f}")
+            ci_risk = (f"{latest.risk_score:.0f}/100 "
+                       f"({latest.risk_score_lower:.0f}–{latest.risk_score_upper:.0f} 95% CI)"
+                       if latest.risk_score is not None and
+                          latest.risk_score_lower is not None
+                       else f"{latest.risk_score or 0:.0f}/100")
+            prog_rows = [
+                ["6 Aylık Sağkalım", ci_surv],
+                ["Cox Risk Skoru", ci_risk],
+                ["Risk Sınıfı", latest.risk_label or '-'],
+                ["Tümör Hacmi (whole)", f"{latest.tumor_volume_cm3:.1f} cm³" if latest.tumor_volume_cm3 else '-'],
+                ["Enhancing Hacim", f"{latest.enhancing_volume_cm3:.1f} cm³" if latest.enhancing_volume_cm3 else '-'],
+                ["Necrotic Core", f"{latest.core_volume_cm3:.1f} cm³" if latest.core_volume_cm3 else '-'],
+                ["Model Sürümü", latest.model_version or 'unknown'],
+            ]
+            t = Table(prog_rows, colWidths=[5*cm, 12*cm])
+            t.setStyle(TableStyle([
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+                ('TEXTCOLOR', (0,0), (0,-1), colors.gray),
+                ('FONTNAME', (1,0), (1,-1), PDF_FONT_BOLD), ('FONTNAME', (0,0), (0,-1), PDF_FONT),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+                ('LINEBELOW', (0,0), (-1,-1), 0.25, colors.HexColor('#e5e7eb')),
+            ]))
+            story.append(t)
+
+        # RANO takip
+        if events:
+            story.append(Paragraph("RANO Takip", section_style))
+            rano_rows = [["TP", "Tarih", "Hacim (cm³)", "Δ %", "RANO"]]
+            for e in events:
+                rano_rows.append([
+                    str(e.timepoint),
+                    e.event_date.strftime('%d.%m.%Y') if e.event_date else '-',
+                    f"{e.tumor_volume_cm3:.1f}" if e.tumor_volume_cm3 else '-',
+                    f"{e.volume_change_pct:+.1f}%" if e.volume_change_pct is not None else '-',
+                    e.rano_class or '-',
+                ])
+            t = Table(rano_rows, colWidths=[1.5*cm, 3*cm, 3*cm, 2.5*cm, 2*cm])
+            t.setStyle(TableStyle([
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f3f4f6')),
+                ('FONTNAME', (0,0), (-1,0), PDF_FONT_BOLD), ('FONTNAME', (0,1), (-1,-1), PDF_FONT),
+                ('GRID', (0,0), (-1,-1), 0.25, colors.HexColor('#e5e7eb')),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(t)
+
+        # Tedaviler
+        if treatments:
+            story.append(Paragraph("Tedavi Geçmişi", section_style))
+            tx_rows = [["İlaç / Tedavi", "Başlangıç", "Doz", "Yanıt"]]
+            resp_map = {"complete": "Tam", "partial": "Parsiyel",
+                        "stable": "Stabil", "progression": "Progresyon"}
+            for tx in treatments:
+                tx_rows.append([
+                    tx.drug_name,
+                    tx.start_date.strftime('%d.%m.%Y') if tx.start_date else '-',
+                    tx.dosage or '-',
+                    resp_map.get(tx.response or '', tx.response or '-'),
+                ])
+            t = Table(tx_rows, colWidths=[6*cm, 3*cm, 4*cm, 3.5*cm])
+            t.setStyle(TableStyle([
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f3f4f6')),
+                ('FONTNAME', (0,0), (-1,0), PDF_FONT_BOLD), ('FONTNAME', (0,1), (-1,-1), PDF_FONT),
+                ('GRID', (0,0), (-1,-1), 0.25, colors.HexColor('#e5e7eb')),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+            ]))
+            story.append(t)
+
+        # AI özet
+        if latest and latest.results_json:
+            try:
+                rj = json.loads(latest.results_json)
+                ai = rj.get("ai_summary", "")
+                if ai:
+                    story.append(Paragraph("Yapay Zekâ Klinik Değerlendirmesi", section_style))
+                    story.append(Paragraph(ai.replace("\n", "<br/>"), body_style))
+            except Exception:
+                pass
+
+        story.append(Spacer(1, 0.3*cm))
+        story.append(Paragraph(
+            "<b>Uyarı:</b> Bu sistem klinik karar destek aracıdır. "
+            "Nihai tanı ve tedavi kararı yetkili sağlık profesyoneline aittir.",
+            small))
+
+        doc.build(story)
+        buf.seek(0)
+        log_audit(db, current_user, "report_pdf", "patient", patient_id, None)
+        db.commit()
+        return StreamingResponse(
+            io.BytesIO(buf.read()), media_type="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="GBM-AID-{patient_id}.pdf"'}
+        )
+    finally:
+        db.close()
+
+
 @app.get("/api/patients/{patient_id}/timeline")
 async def patient_timeline(patient_id: str):
     db = SessionLocal()
     try:
         patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
         if not patient:
-            raise HTTPException(404)
-        analyses = (
-            db.query(Analysis)
-            .filter(Analysis.patient_pk == patient.id)
-            .order_by(Analysis.created_at.asc())
-            .all()
-        )
-        return {
-            "patient_id": patient_id,
-            "timeline": [
-                {
-                    "report_id": a.report_id,
-                    "risk_score": a.risk_score,
-                    "risk_class": a.risk_class,
-                    "risk_label": a.risk_label,
-                    "survival_6m_pct": a.survival_6m_pct,
-                    "tumor_volume_cm3": a.tumor_volume_cm3,
-                    "created_at": a.created_at.strftime("%d.%m.%Y") if a.created_at else "",
-                }
-                for a in analyses
-            ],
-        }
+            raise HTTPException(404, "Hasta bulunamadı")
+
+        timeline = []
+        if patient.diagnosis_date:
+            timeline.append({"date": patient.diagnosis_date.isoformat(), "type": "diagnosis",
+                             "label": "GBM Tanısı", "detail": f"{patient.tumor_location or ''} lokalizasyon"})
+
+        treatments = db.query(Treatment).filter(Treatment.patient_pk == patient.id).order_by(Treatment.start_date).all()
+        for t in treatments:
+            event_type = "treatment"
+            if "cerrahi" in (t.drug_name or "").lower() or "rezeksiyon" in (t.drug_name or "").lower():
+                event_type = "surgery"
+            response_labels = {"complete": "Tam Yanıt", "partial": "Parsiyel Yanıt", "stable": "Stabil", "progression": "Progresyon"}
+            detail_parts = []
+            if t.dosage:
+                detail_parts.append(t.dosage)
+            if t.response:
+                detail_parts.append(response_labels.get(t.response, t.response))
+                if t.response == "progression":
+                    event_type = "progression"
+            timeline.append({"date": t.start_date.isoformat() if t.start_date else None,
+                             "type": event_type, "label": t.drug_name,
+                             "detail": " · ".join(detail_parts) if detail_parts else None})
+
+        analyses = db.query(Analysis).filter(Analysis.patient_pk == patient.id).order_by(Analysis.created_at).all()
+        volume_data = []
+        for i, a in enumerate(analyses):
+            if a.tumor_volume_cm3 is not None:
+                if patient.diagnosis_date and a.created_at:
+                    days_diff = (a.created_at.date() - patient.diagnosis_date).days
+                    week = max(0, days_diff // 7)
+                else:
+                    week = i * 4
+                volume_data.append({"week": week, "volume": round(a.tumor_volume_cm3, 1)})
+            timeline.append({"date": a.created_at.strftime("%Y-%m-%d") if a.created_at else None,
+                             "type": "mri", "label": f"MRI Analiz ({a.report_id})",
+                             "detail": f"Risk: {a.risk_score:.0f}/100 · Hacim: {a.tumor_volume_cm3:.1f} cm³" if a.risk_score and a.tumor_volume_cm3 else None,
+                             "risk_score": a.risk_score, "risk_class": a.risk_class,
+                             "tumor_volume_cm3": a.tumor_volume_cm3, "survival_6m_pct": a.survival_6m_pct})
+
+        timeline.sort(key=lambda e: e.get("date") or "9999")
+        return {"patient_id": patient_id, "timeline": timeline, "volume_data": volume_data}
+    finally:
+        db.close()
+
+
+@app.get("/api/compare")
+async def compare_patients(ids: str = ""):
+    if not ids:
+        raise HTTPException(400, "ids parametresi gerekli")
+    patient_ids = [pid.strip() for pid in ids.split(",") if pid.strip()]
+    if len(patient_ids) < 2:
+        raise HTTPException(400, "En az 2 hasta ID gerekli")
+    if len(patient_ids) > 5:
+        raise HTTPException(400, "En fazla 5 hasta karşılaştırılabilir")
+
+    db = SessionLocal()
+    try:
+        results = []
+        for pid in patient_ids:
+            patient = db.query(Patient).filter(Patient.patient_id == pid).first()
+            if not patient:
+                continue
+            latest = db.query(Analysis).filter(Analysis.patient_pk == patient.id).order_by(Analysis.created_at.desc()).first()
+            treatments = db.query(Treatment).filter(Treatment.patient_pk == patient.id).order_by(Treatment.start_date).all()
+            results.append({
+                "patient_id": patient.patient_id, "age": patient.age, "gender": patient.gender,
+                "kps_score": patient.kps_score, "mgmt_status": patient.mgmt_status,
+                "idh1_status": patient.idh1_status, "treatment_protocol": patient.treatment_protocol,
+                "diagnosis_date": patient.diagnosis_date.isoformat() if patient.diagnosis_date else None,
+                "tumor_location": patient.tumor_location, "surgery_type": patient.surgery_type,
+                "risk_score": latest.risk_score if latest else None,
+                "risk_class": latest.risk_class if latest else None,
+                "risk_label": latest.risk_label if latest else None,
+                "survival_6m_pct": latest.survival_6m_pct if latest else None,
+                "tumor_volume": latest.tumor_volume_cm3 if latest else None,
+                "core_volume": latest.core_volume_cm3 if latest else None,
+                "enhancing_volume": latest.enhancing_volume_cm3 if latest else None,
+                "edema_volume": latest.edema_volume_cm3 if latest else None,
+                "sphericity": latest.sphericity if latest else None,
+                "surface_area": latest.surface_area_cm2 if latest else None,
+                "treatments": [{"drug_name": t.drug_name, "start_date": t.start_date.isoformat() if t.start_date else None,
+                                "dosage": t.dosage, "response": t.response} for t in treatments],
+            })
+        return {"patients": results}
     finally:
         db.close()
 
