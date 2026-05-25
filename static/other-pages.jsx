@@ -192,8 +192,21 @@ function PatientTimeline({ patient }) {
 }
 
 /* ━━━ REPORT PAGE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-function ReportsPage({ patients, selectedPatientId, onSelectPatient, onEditPatient, onAddTreatment }) {
-  const patient = patients.find(p => p.patient_id === selectedPatientId);
+function ReportsPage({ patients, selectedPatientId, onSelectPatient, onEditPatient, onAddTreatment, refreshKey }) {
+  const listPatient = patients.find(p => p.patient_id === selectedPatientId);
+
+  const [fullPatient, setFullPatient] = React.useState(null);
+  const [detailLoading, setDetailLoading] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!selectedPatientId) { setFullPatient(null); return; }
+    setDetailLoading(true);
+    GBM_API.getPatientDetail(selectedPatientId)
+      .then(d => { if (d) setFullPatient(d); setDetailLoading(false); })
+      .catch(() => setDetailLoading(false));
+  }, [selectedPatientId, refreshKey]);
+
+  const patient = fullPatient || listPatient;
 
   const [viewerAxis, setViewerAxis] = React.useState('axial');
   const [viewerSlice, setViewerSlice] = React.useState(77);

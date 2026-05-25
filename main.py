@@ -1448,15 +1448,18 @@ async def cohort_stats():
 async def dashboard_stats():
     db = SessionLocal()
     try:
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, date as date_type
 
-        total_patients = db.query(Patient).count()
-        analyzed = db.query(Analysis.patient_pk).distinct().count()
-
+        today = date_type.today()
         thirty_days_ago = datetime.now() - timedelta(days=30)
+
+        # ── Temel sayılar ───────────────────────────────────────────────
+        total_patients = db.query(Patient).count()
+        analyzed_count = db.query(Analysis.patient_pk).distinct().count()
         new_this_month = db.query(Patient).filter(Patient.created_at >= thirty_days_ago).count()
         analyses_this_month = db.query(Analysis).filter(Analysis.created_at >= thirty_days_ago).count()
 
+        # ── Risk & sağkalım dağılımı ────────────────────────────────────
         all_analyses = db.query(Analysis).all()
         risk_sum = surv_sum = count = 0
         risk_dist = {"low": 0, "medium": 0, "high": 0}
@@ -1467,12 +1470,11 @@ async def dashboard_stats():
                 count += 1
             if a.risk_class in risk_dist:
                 risk_dist[a.risk_class] += 1
-
         avg_risk = round(risk_sum / count, 1) if count else 0
         avg_surv = round(surv_sum / count, 1) if count else 0
-        high_risk_count = risk_dist.get("high", 0)
 
-        recent_analyses = db.query(Analysis).order_by(Analysis.created_at.desc()).limit(10).all()
+        # ── Son analizler ────────────────────────────────────────────────
+        recent_analyses = db.query(Analysis).order_by(Analysis.created_at.desc()).limit(20).all()
         seen_pks = set()
         recent_patients = []
         for a in recent_analyses:
@@ -1489,37 +1491,123 @@ async def dashboard_stats():
                     "risk_class": a.risk_class, "risk_label": a.risk_label,
                     "survival_6m_pct": a.survival_6m_pct, "tumor_volume": a.tumor_volume_cm3,
                     "date": a.created_at.strftime("%d.%m.%Y") if a.created_at else "",
+                    "diagnosis_date": p.diagnosis_date.isoformat() if p.diagnosis_date else None,
                 })
-            if len(recent_patients) >= 5:
+            if len(recent_patients) >= 8:
                 break
 
-        weekly_activity = []
-        for i in range(11, -1, -1):
-            week_start = datetime.now() - timedelta(weeks=i + 1)
-            week_end = datetime.now() - timedelta(weeks=i)
-            weekly_activity.append(db.query(Analysis).filter(
-                Analysis.created_at >= week_start, Analysis.created_at < week_end
-            ).count())
-
+        # ── Yüksek risk uyarıları ────────────────────────────────────────
         high_risk_patients = []
         for a in all_analyses:
             if a.risk_class == "high":
                 p = db.query(Patient).filter(Patient.id == a.patient_pk).first()
                 if p and p.patient_id not in [h["patient_id"] for h in high_risk_patients]:
                     high_risk_patients.append({
-                        "patient_id": p.patient_id, "risk_score": a.risk_score,
-                        "survival_6m_pct": a.survival_6m_pct,
+                        "patient_id": p.patient_id, "age": p.age, "gender": p.gender,
+                        "risk_score": a.risk_score, "survival_6m_pct": a.survival_6m_pct,
                         "tumor_location": p.tumor_location, "surgery_type": p.surgery_type,
+                        "mgmt_status": p.mgmt_status,
                     })
-                if len(high_risk_patients) >= 5:
+                if len(high_risk_patients) >= 8:
                     break
 
+        # ── Progresyon uyarıları (son RANO = PD) ─────────────────────────
+        progression_alerts = []
+        all_patients_with_events = db.query(TumorEvent.patient_pk).distinct().all()
+        for (pk,) in all_patients_with_events:
+            last_event = (db.query(TumorEvent)
+                          .filter(TumorEvent.patient_pk == pk, TumorEvent.rano_class.isnot(None))
+                          .order_by(TumorEvent.timepoint.desc())
+                          .first())
+            if last_event and last_event.rano_class == "PD":
+                p = db.query(Patient).filter(Patient.id == pk).first()
+                a = db.query(Analysis).filter(Analysis.patient_pk == pk).first()
+                if p:
+                    progression_alerts.append({
+                        "patient_id": p.patient_id, "age": p.age, "gender": p.gender,
+                        "risk_score": a.risk_score if a else None,
+                        "risk_class": a.risk_class if a else None,
+                        "survival_6m_pct": a.survival_6m_pct if a else None,
+                        "tumor_location": p.tumor_location,
+                        "last_event_tp": last_event.timepoint,
+                        "last_volume": last_event.tumor_volume_cm3,
+                        "volume_change": last_event.volume_change_pct,
+                        "mgmt_status": p.mgmt_status,
+                    })
+            if len(progression_alerts) >= 8:
+                break
+
+        # ── Tedavi yanıt dağılımı (aktif hastalarda son RANO) ────────────
+        rano_dist = {"CR": 0, "PR": 0, "SD": 0, "PD": 0}
+        for (pk,) in all_patients_with_events:
+            last_ev = (db.query(TumorEvent)
+                       .filter(TumorEvent.patient_pk == pk, TumorEvent.rano_class.isnot(None))
+                       .order_by(TumorEvent.timepoint.desc())
+                       .first())
+            if last_ev and last_ev.rano_class in rano_dist:
+                rano_dist[last_ev.rano_class] += 1
+
+        # ── Yaklaşan kontrol MR'ları ─────────────────────────────────────
+        # Son TumorEvent'ten 90 gün sonra (±21 gün içinde olanlar)
+        upcoming_mri = []
+        all_pts_with_diag = db.query(Patient).filter(Patient.diagnosis_date.isnot(None)).all()
+        for p in all_pts_with_diag:
+            # Son TumorEvent tarihini bul
+            last_event = (db.query(TumorEvent)
+                          .filter(TumorEvent.patient_pk == p.id, TumorEvent.event_date.isnot(None))
+                          .order_by(TumorEvent.timepoint.desc())
+                          .first())
+            base_date = last_event.event_date if last_event and last_event.event_date else p.diagnosis_date
+            next_mri  = base_date + timedelta(days=90)
+            days_left = (next_mri - today).days
+
+            if -7 <= days_left <= 30:  # geçmiş 1 hafta veya önümüzdeki 30 gün
+                a = db.query(Analysis).filter(Analysis.patient_pk == p.id).first()
+                status = "gecikmiş" if days_left < 0 else ("yakın" if days_left <= 7 else "planlı")
+                upcoming_mri.append({
+                    "patient_id": p.patient_id, "age": p.age, "gender": p.gender,
+                    "next_mri_date": next_mri.isoformat(),
+                    "days_left": days_left,
+                    "status": status,
+                    "risk_class": a.risk_class if a else None,
+                    "risk_score": a.risk_score if a else None,
+                    "tumor_location": p.tumor_location,
+                    "last_rano": (db.query(TumorEvent)
+                                  .filter(TumorEvent.patient_pk == p.id, TumorEvent.rano_class.isnot(None))
+                                  .order_by(TumorEvent.timepoint.desc())
+                                  .first() or type('', (), {'rano_class': None})()).rano_class,
+                })
+
+        upcoming_mri.sort(key=lambda x: x["days_left"])
+
+        # ── Moleküler & cerrahi istatistikler ───────────────────────────
+        all_pts = db.query(Patient).all()
+        mol_stats = {
+            "mgmt_methylated":   sum(1 for p in all_pts if p.mgmt_status == "methylated"),
+            "mgmt_unmethylated": sum(1 for p in all_pts if p.mgmt_status == "unmethylated"),
+            "idh_wildtype":      sum(1 for p in all_pts if p.idh1_status == "wildtype"),
+            "idh_mutant":        sum(1 for p in all_pts if p.idh1_status == "mutant"),
+            "gtr":               sum(1 for p in all_pts if p.surgery_type == "GTR"),
+            "str":               sum(1 for p in all_pts if p.surgery_type == "STR"),
+        }
+
         return {
-            "total_patients": total_patients, "analyzed": analyzed,
-            "avg_risk": avg_risk, "avg_surv": avg_surv,
-            "this_month": {"new_patients": new_this_month, "completed_analyses": analyses_this_month, "high_risk_alerts": high_risk_count},
-            "risk_dist": risk_dist, "recent_patients": recent_patients,
-            "weekly_activity": weekly_activity, "high_risk_patients": high_risk_patients,
+            "total_patients": total_patients,
+            "analyzed": analyzed_count,
+            "avg_risk": avg_risk,
+            "avg_surv": avg_surv,
+            "this_month": {
+                "new_patients": new_this_month,
+                "completed_analyses": analyses_this_month,
+                "high_risk_alerts": risk_dist.get("high", 0),
+            },
+            "risk_dist": risk_dist,
+            "rano_dist": rano_dist,
+            "recent_patients": recent_patients,
+            "high_risk_patients": high_risk_patients,
+            "progression_alerts": progression_alerts,
+            "upcoming_mri": upcoming_mri,
+            "mol_stats": mol_stats,
         }
     finally:
         db.close()

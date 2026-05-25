@@ -94,6 +94,7 @@ function App() {
   const [editModal, setEditModal] = React.useState(null);
   const [comparePreselect, setComparePreselect] = React.useState(null);
   const [fallbackActive, setFallbackActive] = React.useState(false);
+  const [reportRefreshKey, setReportRefreshKey] = React.useState(0);
   const [currentUser, setCurrentUser] = React.useState(null);
   const [authChecked, setAuthChecked] = React.useState(false);
   const [tweaks, setTweak] = useTweaks(TWEAKS_DEFAULTS);
@@ -194,10 +195,7 @@ function App() {
   const handleSaveTreatment = async (treatment) => {
     const result = await GBM_API.addTreatment(treatmentModal, treatment);
     if (result) {
-      setPatients(prev => prev.map(p => p.patient_id === treatmentModal
-        ? { ...p, treatments: [...(p.treatments || []), treatment] } : p));
-      // CSV/analyze/delete sonrasında listeyi tazele
-      loadPatients(true);
+      setReportRefreshKey(k => k + 1);
     }
     setTreatmentModal(null);
   };
@@ -241,7 +239,8 @@ function App() {
           patients, selectedPatientId: selectedReportPatient,
           onSelectPatient: setSelectedReportPatient,
           onEditPatient: p => setEditModal(p),
-          onAddTreatment: pid => setTreatmentModal(pid)
+          onAddTreatment: pid => setTreatmentModal(pid),
+          refreshKey: reportRefreshKey
         })
       );
       break;
@@ -292,8 +291,7 @@ function App() {
     // Top bar
     React.createElement('header', { className: 'topbar' },
       React.createElement('div', { className: 'topbar-brand' },
-        React.createElement('div', { className: 'topbar-logo' }, 'GA'),
-        React.createElement('span', null, 'GBM-AID'),
+React.createElement('span', null, 'GBM-AID'),
         React.createElement('span', { className: 'topbar-sub' }, 'Hekim Paneli')
       ),
       React.createElement('nav', { className: 'topbar-nav' },
