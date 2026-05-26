@@ -549,6 +549,167 @@ function CalibrationPlot({ bins, brier, width = 480, height = 360 }) {
   );
 }
 
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ROCCurve — ROC eğrisi + AUC + diagonal (rastgele sınıflandırıcı)
+   props: { points: [{fpr,tpr,threshold}], auc, ci, label, color }
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+function ROCCurve({ points, auc, ci, label = '6 Aylık Sağkalım', color = 'var(--accent)', width = 460, height = 380 }) {
+  const pad = { l: 56, r: 18, t: 18, b: 60 };
+  const W = width - pad.l - pad.r, H = height - pad.t - pad.b;
+  const x = v => pad.l + v * W;
+  const y = v => pad.t + (1 - v) * H;
+
+  if (!points || points.length === 0) {
+    return React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 } },
+      'ROC için yeterli veri yok.');
+  }
+
+  // Path
+  const d = points.map((p, i) => `${i ? 'L' : 'M'}${x(p.fpr).toFixed(1)},${y(p.tpr).toFixed(1)}`).join(' ');
+  // Fill area (AUC bölgesi)
+  const fill = d + ` L${x(1).toFixed(1)},${y(0).toFixed(1)} L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+
+  const ticks = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
+
+  return React.createElement('div', { style: { width: '100%' } },
+    React.createElement('svg', {
+      viewBox: `0 0 ${width} ${height}`, width: '100%',
+      style: { display: 'block', fontFamily: 'var(--font)' }
+    },
+      // Grid
+      ticks.map(t => React.createElement('g', { key: 't' + t },
+        React.createElement('line', { x1: x(t), y1: pad.t, x2: x(t), y2: pad.t + H,
+          stroke: 'var(--border-light)', strokeDasharray: t === 0 || t === 1 ? '' : '3,4', opacity: 0.6 }),
+        React.createElement('line', { x1: pad.l, y1: y(t), x2: pad.l + W, y2: y(t),
+          stroke: 'var(--border-light)', strokeDasharray: t === 0 || t === 1 ? '' : '3,4', opacity: 0.6 }),
+        React.createElement('text', { x: x(t), y: pad.t + H + 16, textAnchor: 'middle',
+          fontSize: 10.5, fill: 'var(--text-muted)', fontFamily: 'var(--mono)' }, t.toFixed(1)),
+        React.createElement('text', { x: pad.l - 8, y: y(t) + 4, textAnchor: 'end',
+          fontSize: 10.5, fill: 'var(--text-muted)', fontFamily: 'var(--mono)' }, t.toFixed(1))
+      )),
+      // Diagonal (rastgele)
+      React.createElement('line', { x1: x(0), y1: y(0), x2: x(1), y2: y(1),
+        stroke: 'var(--text-faint)', strokeWidth: 1, strokeDasharray: '5,4' }),
+      // AUC fill
+      React.createElement('path', { d: fill, fill: color, opacity: 0.12 }),
+      // Curve
+      React.createElement('path', { d: d, fill: 'none', stroke: color, strokeWidth: 2.5,
+        strokeLinejoin: 'round', strokeLinecap: 'round' }),
+      // Axis labels
+      React.createElement('text', { x: pad.l + W / 2, y: height - 10, textAnchor: 'middle',
+        fontSize: 11.5, fill: 'var(--text-secondary)', fontWeight: 600 },
+        '1 − Özgüllük (False Positive Rate)'),
+      React.createElement('text', { x: 14, y: pad.t + H / 2, textAnchor: 'middle',
+        fontSize: 11.5, fill: 'var(--text-secondary)', fontWeight: 600,
+        transform: `rotate(-90, 14, ${pad.t + H / 2})` },
+        'Duyarlılık (True Positive Rate)'),
+      // AUC label box
+      React.createElement('g', { transform: `translate(${pad.l + W - 130}, ${pad.t + 12})` },
+        React.createElement('rect', { x: 0, y: 0, width: 122, height: ci ? 52 : 34, rx: 6,
+          fill: 'var(--surface)', stroke: 'var(--border)', strokeWidth: 1, opacity: 0.95 }),
+        React.createElement('text', { x: 8, y: 18, fontSize: 11, fontWeight: 700,
+          fill: 'var(--text-muted)', letterSpacing: 0.5 }, label.toUpperCase()),
+        React.createElement('text', { x: 8, y: 32, fontSize: 16, fontWeight: 800,
+          fill: 'var(--text)', fontFamily: 'var(--mono)' },
+          'AUC: ', React.createElement('tspan', { fill: color }, (auc || 0).toFixed(3))),
+        ci && React.createElement('text', { x: 8, y: 48, fontSize: 10.5,
+          fill: 'var(--text-muted)', fontFamily: 'var(--mono)' },
+          `95% CI: ${ci[0].toFixed(2)}–${ci[1].toFixed(2)}`)
+      ),
+      // Diagonal label
+      React.createElement('text', { x: x(0.5) - 4, y: y(0.5) + 16, fontSize: 10, fill: 'var(--text-faint)',
+        fontStyle: 'italic', textAnchor: 'middle', transform: `rotate(-45, ${x(0.5)}, ${y(0.5)})` },
+        'Rastgele (AUC=0.5)')
+    )
+  );
+}
+
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ForestPlot — Öznitelik etkileri (coef/OR + CI)
+   props: { items: [{label, value, lo?, hi?, neutral=0, color?}], xRange=[lo,hi], unit='coef' }
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+function ForestPlot({ items, xRange, neutral = 0, unit = '', width = 720, height = null }) {
+  const rowH = 28;
+  const pad = { l: 220, r: 90, t: 28, b: 40 };
+  const H = height || (pad.t + pad.b + items.length * rowH);
+  const W = width - pad.l - pad.r;
+
+  if (!items || items.length === 0) {
+    return React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 } },
+      'Öznitelik verisi yok.');
+  }
+
+  // Auto x-range
+  const vals = items.flatMap(it => [it.value, it.lo, it.hi].filter(v => v != null));
+  const dataMin = Math.min(...vals, neutral);
+  const dataMax = Math.max(...vals, neutral);
+  const pad_x = (dataMax - dataMin) * 0.12 || 1;
+  const xLo = xRange ? xRange[0] : dataMin - pad_x;
+  const xHi = xRange ? xRange[1] : dataMax + pad_x;
+  const x = v => pad.l + ((v - xLo) / (xHi - xLo)) * W;
+
+  // X-axis ticks
+  const range = xHi - xLo;
+  const step = range < 4 ? 0.5 : range < 10 ? 2 : 5;
+  const ticks = [];
+  for (let t = Math.ceil(xLo / step) * step; t <= xHi; t += step) ticks.push(+t.toFixed(2));
+
+  return React.createElement('div', { style: { width: '100%' } },
+    React.createElement('svg', { viewBox: `0 0 ${width} ${H}`, width: '100%',
+      style: { display: 'block', fontFamily: 'var(--font)' } },
+      // Header
+      React.createElement('text', { x: 8, y: 18, fontSize: 11, fontWeight: 700,
+        fill: 'var(--text-muted)', letterSpacing: 0.5 }, 'ÖZNİTELİK'),
+      React.createElement('text', { x: pad.l + W / 2, y: 18, fontSize: 11, fontWeight: 700,
+        fill: 'var(--text-muted)', letterSpacing: 0.5, textAnchor: 'middle' },
+        unit ? `ETKİ (${unit})` : 'ETKİ'),
+      React.createElement('text', { x: width - 8, y: 18, fontSize: 11, fontWeight: 700,
+        fill: 'var(--text-muted)', letterSpacing: 0.5, textAnchor: 'end' }, 'DEĞER'),
+
+      // X-axis grid + neutral line
+      ticks.map(t => React.createElement('g', { key: 'tk' + t },
+        React.createElement('line', { x1: x(t), y1: pad.t, x2: x(t), y2: H - pad.b,
+          stroke: t === neutral ? 'var(--text-muted)' : 'var(--border-light)',
+          strokeWidth: t === neutral ? 1.5 : 1,
+          strokeDasharray: t === neutral ? '' : '3,4', opacity: t === neutral ? 0.7 : 0.45 }),
+        React.createElement('text', { x: x(t), y: H - pad.b + 14, textAnchor: 'middle',
+          fontSize: 10, fill: 'var(--text-muted)', fontFamily: 'var(--mono)' }, t)
+      )),
+
+      // Rows
+      items.map((it, i) => {
+        const yr = pad.t + i * rowH + rowH / 2;
+        const dir = it.value > neutral ? 'right' : 'left';
+        const col = it.color || (dir === 'right' ? '#b91c1c' : '#15803d');
+        return React.createElement('g', { key: it.label + i },
+          // Label
+          React.createElement('text', { x: 8, y: yr + 4, fontSize: 12,
+            fontWeight: 500, fill: 'var(--text)' }, it.label),
+          // Row separator
+          i > 0 && React.createElement('line', { x1: 0, y1: yr - rowH / 2,
+            x2: width, y2: yr - rowH / 2, stroke: 'var(--border-light)', opacity: 0.35 }),
+          // CI bar
+          it.lo != null && it.hi != null && React.createElement('line', {
+            x1: x(it.lo), y1: yr, x2: x(it.hi), y2: yr,
+            stroke: col, strokeWidth: 2, opacity: 0.6
+          }),
+          // CI caps
+          it.lo != null && React.createElement('line', { x1: x(it.lo), y1: yr - 4, x2: x(it.lo), y2: yr + 4, stroke: col, strokeWidth: 2, opacity: 0.6 }),
+          it.hi != null && React.createElement('line', { x1: x(it.hi), y1: yr - 4, x2: x(it.hi), y2: yr + 4, stroke: col, strokeWidth: 2, opacity: 0.6 }),
+          // Point estimate
+          React.createElement('circle', { cx: x(it.value), cy: yr, r: 5, fill: col, stroke: '#fff', strokeWidth: 1.5 }),
+          // Value label
+          React.createElement('text', { x: width - 8, y: yr + 4, textAnchor: 'end',
+            fontSize: 11.5, fontFamily: 'var(--mono)', fontWeight: 700, fill: 'var(--text)' },
+            it.value.toFixed(2))
+        );
+      })
+    )
+  );
+}
+
+
 window.Sparkline = Sparkline;
 window.DonutChart = DonutChart;
 window.CalibrationPlot = CalibrationPlot;
@@ -557,3 +718,5 @@ window.RiskWaterfall = RiskWaterfall;
 window.RadiomicRadar = RadiomicRadar;
 window.TumorTimeline = TumorTimeline;
 window.ActivityHeatmap = ActivityHeatmap;
+window.ROCCurve = ROCCurve;
+window.ForestPlot = ForestPlot;

@@ -273,33 +273,7 @@ const GBM_API = {
   async runAnalysis(payload) {
     const data = await this._post('/api/analyze', payload);
     if (data) return data;
-    // fallback: hata — backend gerekiyor (eski mock hasta üretimi kaldırıldı)
     return null;
-  },
-
-  // Eski mock-result-üreten kod (referans için tutuldu, çağrılmıyor):
-  _legacyMockAnalysisResult(payload) {
-    return {
-      patient_id: payload.patient_id,
-      results: {
-        report_id: 'GBM-RPT-MOCK',
-        risk_score: null,
-        risk_class: null,
-        risk_label: null,
-        survival_6m_pct: null,
-        radiomics: {
-          tumor_volume_cm3: null,
-          core_volume_cm3: null,
-          enhancing_volume_cm3: null,
-          edema_volume_cm3: null,
-        },
-        similar_patients: MOCK.similarPatients,
-        literature: MOCK.literature,
-        projection: MOCK.projection,
-        risk_factors: MOCK.riskFactors,
-        ai_summary: '',
-      },
-    };
   },
 
   // ─── MRI Slice URL ──────────────────────────────────────
@@ -358,6 +332,15 @@ const GBM_API = {
   },
   async getModelCard() {
     return await this._get('/api/model-card');
+  },
+  async getSciencePerformance() {
+    return await this._get('/api/science/performance');
+  },
+  async getScienceROC() {
+    return await this._get('/api/science/roc');
+  },
+  async getScienceFeatureEffects() {
+    return await this._get('/api/science/feature-effects');
   },
 
   // ─── Case notes ─────────────────────────────────────────

@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 import os
 import re
 import uuid
@@ -320,27 +321,55 @@ def extract_nifti_slice(file_path: str, axis: str = "axial", index: int | None =
     if overlay_paths:
         overlay = np.array(img_pil, dtype=np.float32)
         img_h, img_w = overlay.shape[:2]
-        seg_colors = {1: (220, 50, 50), 2: (180, 120, 30), 4: (230, 230, 50)}
+        # BraTS:        1=necrotic, 2=edema,     4=enhancing
+        # DeepBraTumIA: 1=enhancing, 2=necrotic, 3=edema
+        # HD-GLIO:      1=non-enh.,  2=enhancing
+        # Renkler tüm konvansiyonları kapsar; bilinmeyen label varsa binary fallback.
+        seg_colors = {
+            1: (220, 50, 50),    # red — enhancing / necrotic
+            2: (180, 120, 30),   # brown — edema (BraTS) / enhancing (HD-GLIO) / necrotic (DBT)
+            3: (230, 180, 60),   # amber — edema (DeepBraTumIA)
+            4: (230, 230, 50),   # yellow — enhancing (BraTS)
+        }
         for op in overlay_paths:
             if not os.path.exists(op):
                 continue
             try:
                 sd, _ = _nifti_data_cached(op)
+                # Axis order can differ between MR and seg (e.g. FLAIR vs flair_seg_mask).
+                # Match the seg slicing direction to its own shape rather than blindly using
+                # the same axis index — pick the axis that yields a 2D slice closest to img_h × img_w.
+                shape3 = sd.shape[:3]
                 if axis == "sagittal":
                     ss = sd[idx, :, :]
                 elif axis == "coronal":
                     ss = sd[:, idx, :]
                 else:
                     ss = sd[:, :, idx]
+                # Fallback: if any axis dim equals overlay height/width, prefer that axis
+                if ss.shape[:2] != (img_h, img_w) and ss.shape[:2] != (img_w, img_h):
+                    # Try other axes — pick one with matching dims
+                    for a in (0, 1, 2):
+                        if a == (0 if axis == "sagittal" else 1 if axis == "coronal" else 2):
+                            continue
+                        if shape3[a] <= idx:
+                            continue
+                        cand = (sd[idx, :, :] if a == 0 else
+                                sd[:, idx, :] if a == 1 else
+                                sd[:, :, idx])
+                        if cand.shape[:2] == (img_h, img_w) or cand.shape[:2] == (img_w, img_h):
+                            ss = cand
+                            break
                 ss = np.rot90(ss.copy())
-                # Resize seg slice to match main image if resolutions differ
+                # Resize seg slice to match main image if resolutions still differ (nearest = label-preserving)
                 if ss.shape[0] != img_h or ss.shape[1] != img_w:
                     ss_pil = Image.fromarray(np.round(ss).clip(0, 255).astype(np.uint8))
                     ss_pil = ss_pil.resize((img_w, img_h), Image.NEAREST)
                     ss = np.array(ss_pil, dtype=np.float32)
-                # Binary mask (0/1) → treat label 1 as whole tumor (red)
                 unique = set(np.unique(ss[ss > 0]).astype(int))
-                use_binary = unique <= {1}
+                # Binary fallback when (a) only label 1, or (b) labels don't overlap known palette
+                known = set(seg_colors.keys())
+                use_binary = (not unique) or (unique <= {1}) or not (unique & known)
                 for lv, color in seg_colors.items():
                     mask = (ss == lv) if not use_binary else (ss > 0)
                     if not np.any(mask):
@@ -624,13 +653,25 @@ def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "") -
         pdir = patient_dir / tps[0] if tps else None
     if not pdir or not pdir.exists():
         return None
+    dbt_native = pdir / "DeepBraTumIA-segmentation" / "native" / "segmentation"
+    hdg_native = pdir / "HD-GLIO-AUTO-segmentation" / "native"
     fmap = {
         "CT1.nii.gz": pdir / "CT1.nii.gz",
         "FLAIR.nii.gz": pdir / "FLAIR.nii.gz",
         "T1.nii.gz": pdir / "T1.nii.gz",
         "T2.nii.gz": pdir / "T2.nii.gz",
+        # Atlas-space (MNI) — only matches atlas/skull_strip MR files, NOT raw modalities
         "seg_mask.nii.gz": pdir / "DeepBraTumIA-segmentation" / "atlas" / "segmentation" / "seg_mask.nii.gz",
         "seg_hdglio.nii.gz": pdir / "HD-GLIO-AUTO-segmentation" / "registered" / "segmentation.nii.gz",
+        # Per-modality NATIVE space — these align voxel-wise with raw CT1/FLAIR/T1/T2.nii.gz
+        "ct1_seg_mask.nii.gz":   dbt_native / "ct1_seg_mask.nii.gz",
+        "flair_seg_mask.nii.gz": dbt_native / "flair_seg_mask.nii.gz",
+        "t1_seg_mask.nii.gz":    dbt_native / "t1_seg_mask.nii.gz",
+        "t2_seg_mask.nii.gz":    dbt_native / "t2_seg_mask.nii.gz",
+        "seg_CT1_origspace.nii.gz":   hdg_native / "segmentation_CT1_origspace.nii.gz",
+        "seg_FLAIR_origspace.nii.gz": hdg_native / "segmentation_FLAIR_origspace.nii.gz",
+        "seg_T1_origspace.nii.gz":    hdg_native / "segmentation_T1_origspace.nii.gz",
+        "seg_T2_origspace.nii.gz":    hdg_native / "segmentation_T2_origspace.nii.gz",
     }
     target = fmap.get(filename)
     if target and target.exists():
@@ -639,6 +680,20 @@ def _resolve_lumiere_path(patient_id: str, filename: str, timepoint: str = "") -
     if direct.exists():
         return direct
     return None
+
+
+# Modality-aware seg fallback: given a main MR filename, pick the matching native seg
+_MODALITY_SEG_MAP = {
+    "CT1.nii.gz":   "ct1_seg_mask.nii.gz",
+    "FLAIR.nii.gz": "flair_seg_mask.nii.gz",
+    "T1.nii.gz":    "t1_seg_mask.nii.gz",
+    "T2.nii.gz":    "t2_seg_mask.nii.gz",
+}
+
+
+def _auto_overlay_for(main_filename: str) -> str | None:
+    """Return native-space seg filename matching a given LUMIERE modality file."""
+    return _MODALITY_SEG_MAP.get(main_filename)
 
 
 @app.get("/api/lumiere-patients")
@@ -692,13 +747,34 @@ async def lumiere_files(patient_id: str, timepoint: str = ""):
                 "size_mb": round(fpath.stat().st_size / (1024 * 1024), 2),
             })
 
+    # Per-modality NATIVE segmentations (aligned with raw MR — usable as overlay)
+    dbt_native_dir = tp_dir / "DeepBraTumIA-segmentation" / "native" / "segmentation"
+    for seg_fn, label in [
+        ("ct1_seg_mask.nii.gz",   "Tümör Maskesi (CT1 native)"),
+        ("flair_seg_mask.nii.gz", "Tümör Maskesi (FLAIR native)"),
+        ("t1_seg_mask.nii.gz",    "Tümör Maskesi (T1 native)"),
+        ("t2_seg_mask.nii.gz",    "Tümör Maskesi (T2 native)"),
+    ]:
+        sp = dbt_native_dir / seg_fn
+        if sp.exists():
+            info = get_nifti_info(str(sp))
+            files.append({
+                "filename": seg_fn,
+                "modality": "SEG",
+                "modality_label": label,
+                "shape": info["shape"],
+                "voxel_size": info["voxel_size"],
+                "size_mb": round(sp.stat().st_size / (1024 * 1024), 2),
+            })
+
+    # Atlas-space seg (kept for reference but auto-substituted by /api/slice when mismatch)
     seg_path = tp_dir / "DeepBraTumIA-segmentation" / "atlas" / "segmentation" / "seg_mask.nii.gz"
     if seg_path.exists():
         info = get_nifti_info(str(seg_path))
         files.append({
             "filename": "seg_mask.nii.gz",
             "modality": "SEG",
-            "modality_label": "Segmentasyon (DeepBraTumIA)",
+            "modality_label": "Segmentasyon (atlas/MNI)",
             "shape": info["shape"],
             "voxel_size": info["voxel_size"],
             "size_mb": round(seg_path.stat().st_size / (1024 * 1024), 2),
@@ -736,19 +812,46 @@ async def get_slice(session_id: str, filename: str, axis: str = "axial", index: 
     if not fp or not fp.exists():
         raise HTTPException(404)
 
+    # Main file shape — needed to auto-swap mismatched LUMIERE overlays
+    main_shape = None
+    if HAS_NIBABEL:
+        try:
+            _, main_shape = _nifti_data_cached(str(fp))
+        except Exception:
+            main_shape = None
+
     overlay_list = []
     if overlays:
+        is_lumiere = session_id.startswith("Patient-")
+        pid = tp = ""
+        if is_lumiere:
+            parts = session_id.split(":", 1)
+            pid = parts[0]
+            tp = parts[1] if len(parts) > 1 else ""
+
         for ov in overlays.split(","):
             ov_name = ov.strip()
             ov_path = None
-            if session_id.startswith("Patient-"):
-                parts = session_id.split(":", 1)
-                pid = parts[0]
-                tp = parts[1] if len(parts) > 1 else ""
+            if is_lumiere:
                 ov_path = _resolve_lumiere_path(pid, ov_name, tp)
             if ov_path is None:
                 ov_safe = re.sub(r"[^\w.\-]", "_", ov_name)
                 ov_path = UPLOAD_DIR / session_id / ov_safe
+
+            # Spatial-alignment check: for LUMIERE, atlas-space seg won't align with
+            # native-space MR. If shape doesn't match, swap to the per-modality native seg.
+            if is_lumiere and ov_path and ov_path.exists() and main_shape and HAS_NIBABEL:
+                try:
+                    _, ov_shape = _nifti_data_cached(str(ov_path))
+                    if tuple(ov_shape[:3]) != tuple(main_shape[:3]):
+                        alt_name = _auto_overlay_for(filename)
+                        if alt_name:
+                            alt_path = _resolve_lumiere_path(pid, alt_name, tp)
+                            if alt_path and alt_path.exists():
+                                ov_path = alt_path
+                except Exception:
+                    pass
+
             if ov_path and ov_path.exists():
                 overlay_list.append(str(ov_path))
 
@@ -997,7 +1100,43 @@ async def get_patient(patient_id: str):
 
         if latest:
             result["results"] = json.loads(latest.results_json) if latest.results_json else {}
-            result["files"] = json.loads(latest.files_json) if latest.files_json else []
+            files_list = json.loads(latest.files_json) if latest.files_json else []
+
+            # Segmentasyon dosyaları files_json'a genellikle eklenmiyor;
+            # upload klasörünü veya LUMIERE dizinini kontrol edip bulunanları ekle.
+            session = latest.session_id or ""
+            existing = {f.get("filename", "") for f in files_list}
+            if session and not session.startswith("Patient-"):
+                upload_session_dir = UPLOAD_DIR / session
+                for seg_name, seg_mod in [
+                    ("whole.nii.gz",        "SEG"),
+                    ("core.nii.gz",         "SEG"),
+                    ("seg_mask.nii.gz",     "SEG"),
+                    ("segmentation.nii.gz", "SEG"),
+                    ("enh.nii.gz",          "SEG"),
+                ]:
+                    if seg_name not in existing and (upload_session_dir / seg_name).exists():
+                        files_list.append({"filename": seg_name, "modality": seg_mod, "confidence": 90})
+            elif session.startswith("Patient-"):
+                parts = session.split(":", 1)
+                _pid = parts[0]
+                _tp = parts[1] if len(parts) > 1 else ""
+                # Native-space per-modality segs (align with raw CT1/T1/T2/FLAIR.nii.gz)
+                # — viewer'a verince auto-substitute olmadan direkt overlay olarak çalışır.
+                for seg_name in [
+                    "ct1_seg_mask.nii.gz",
+                    "flair_seg_mask.nii.gz",
+                    "t1_seg_mask.nii.gz",
+                    "t2_seg_mask.nii.gz",
+                    "seg_mask.nii.gz",
+                    "seg_hdglio.nii.gz",
+                ]:
+                    if seg_name not in existing:
+                        rp = _resolve_lumiere_path(_pid, seg_name, _tp)
+                        if rp and rp.exists():
+                            files_list.append({"filename": seg_name, "modality": "SEG", "confidence": 90})
+
+            result["files"] = files_list
             result["session_id"] = latest.session_id
         else:
             result["results"] = {}
@@ -1255,34 +1394,6 @@ async def add_treatment(patient_id: str, request: Request, current_user: User = 
     except Exception as e:
         db.rollback()
         raise HTTPException(400, str(e))
-    finally:
-        db.close()
-
-
-@app.get("/api/patients/{patient_id}/treatments")
-async def get_treatments(patient_id: str):
-    db = SessionLocal()
-    try:
-        patient = db.query(Patient).filter(Patient.patient_id == patient_id).first()
-        if not patient:
-            raise HTTPException(404)
-        treatments = db.query(Treatment).filter(Treatment.patient_pk == patient.id).all()
-        return {
-            "treatments": [
-                {
-                    "id": t.id,
-                    "drug_name": t.drug_name,
-                    "protocol": t.protocol,
-                    "dosage": t.dosage,
-                    "cycles": t.cycles,
-                    "response": t.response,
-                    "start_date": t.start_date.isoformat() if t.start_date else None,
-                    "end_date": t.end_date.isoformat() if t.end_date else None,
-                    "notes": t.notes,
-                }
-                for t in treatments
-            ]
-        }
     finally:
         db.close()
 
@@ -1711,14 +1822,41 @@ async def cohort_km(
                 "low": "Düşük Risk", "medium": "Orta Risk", "high": "Yüksek Risk",
                 "M": "Erkek", "F": "Kadın", "unknown": "Bilinmiyor",
             }.get(label, label)
+
+            # Medyan sağkalım: S(t) ilk kez ≤ 0.5'e düştüğü t (ay)
+            n = len(ps)
+            s = 1.0
+            median = None
+            for t in sorted(set(events)):
+                d = sum(1 for x in events if x == t)
+                if n > 0:
+                    s *= (1 - d / n)
+                # zamanın sansürleri n'den düş (basit yaklaşım)
+                c = sum(1 for x in censored if x == t)
+                n -= d + c
+                if median is None and s <= 0.5:
+                    median = round(t, 1)
+
             curves.append({
                 "label": label_tr, "color": COLORS.get(label, "#0d9488"),
-                "n0": len(ps), "events": sorted(events), "censored": sorted(censored),
+                "n0": len(ps),
+                "n_events": len(events), "n_censored": len(censored),
+                "median_months": median,
+                "events": sorted(events), "censored": sorted(censored),
             })
+
+        # Log-rank testi: tüm stratumlar arası (k≥2)
+        logrank_p = None
+        if len(curves) >= 2:
+            logrank_p = _logrank_p([
+                {"events": c["events"], "censored": c["censored"], "n0": c["n0"]}
+                for c in curves
+            ])
 
         return {
             "stratify": stratify, "total_filtered": len(patients),
             "max_months": max_months, "curves": curves,
+            "logrank_p": logrank_p,
         }
     finally:
         db.close()
@@ -1837,6 +1975,363 @@ async def model_card(current_user: User = Depends(get_current_user)):
         }
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Bilim & Model Doğrulama — gerçek metrikler
+# ---------------------------------------------------------------------------
+
+def _load_outcome_records():
+    """
+    Tüm hastaların son analizini + survival_days/status'unu döndürür.
+    Sonuç: list of dict {pred_6m: 0..1, risk_score: 0..100, survived_180d: 0|1,
+                          t_days: int, event: 0|1, age, mgmt, idh1}
+    """
+    db = SessionLocal()
+    try:
+        analyses = (
+            db.query(Analysis, Patient)
+              .join(Patient, Patient.id == Analysis.patient_pk)
+              .filter(Patient.survival_days.isnot(None))
+              .all()
+        )
+        latest: dict[int, tuple] = {}
+        for a, p in analyses:
+            cur = latest.get(p.id)
+            if cur is None or (a.created_at and (not cur[0].created_at or a.created_at > cur[0].created_at)):
+                latest[p.id] = (a, p)
+
+        recs = []
+        for a, p in latest.values():
+            recs.append({
+                "patient_id": p.patient_id,
+                "pred_6m": (a.survival_6m_pct or 0) / 100.0,
+                "risk_score": a.risk_score,
+                "t_days": p.survival_days or 0,
+                "event": 1 if (p.status or "").lower() == "deceased" else 0,
+                "survived_180d": 1 if (p.survival_days or 0) >= 180 else 0,
+                "age": p.age, "mgmt": p.mgmt_status, "idh1": p.idh1_status,
+            })
+        return recs
+    finally:
+        db.close()
+
+
+def _harrell_c_index(records, score_key="risk_score"):
+    """Harrell's C-index — risk skoru yüksek olanın daha kısa süre yaşaması beklenir.
+    Pair (i,j): event_i=1 ve t_i < t_j olan tüm çiftler değerlendirilebilir.
+    Concordant: score_i > score_j (daha yüksek risk → daha kısa sağkalım).
+    """
+    n = len(records)
+    if n < 2:
+        return None
+    concordant = 0
+    permissible = 0
+    tied = 0
+    for i in range(n):
+        if not records[i]["event"]:
+            continue
+        ti = records[i]["t_days"]
+        si = records[i].get(score_key) or 0
+        for j in range(n):
+            if i == j:
+                continue
+            tj = records[j]["t_days"]
+            sj = records[j].get(score_key) or 0
+            # i'nin event'i var ve i daha erken öldü; j ya hayatta ya da j daha sonra öldü
+            if records[j]["event"] == 0 and tj < ti:
+                # j hayatta + j'nin takip süresi i'den kısa → karşılaştırılamaz
+                continue
+            if tj <= ti and records[j]["event"]:
+                continue
+            permissible += 1
+            if si > sj:
+                concordant += 1
+            elif si == sj:
+                tied += 1
+    if permissible == 0:
+        return None
+    return round((concordant + 0.5 * tied) / permissible, 4)
+
+
+def _roc_curve(predictions, labels):
+    """Returns list of (fpr, tpr, threshold). AUC trapezoidal."""
+    pairs = sorted(zip(predictions, labels), key=lambda x: -x[0])
+    P = sum(labels)
+    N = len(labels) - P
+    if P == 0 or N == 0:
+        return [], None
+    tp = fp = 0
+    pts = [(0.0, 0.0, 1.0)]
+    last_p = None
+    for pred, lab in pairs:
+        if pred != last_p:
+            pts.append((fp / N, tp / P, pred))
+            last_p = pred
+        if lab:
+            tp += 1
+        else:
+            fp += 1
+    pts.append((1.0, 1.0, 0.0))
+    auc = 0.0
+    for i in range(1, len(pts)):
+        auc += (pts[i][0] - pts[i - 1][0]) * (pts[i][1] + pts[i - 1][1]) / 2
+    return pts, round(auc, 4)
+
+
+def _bootstrap_auc(predictions, labels, n_iter=200, seed=42):
+    """Bootstrap %95 CI for AUC."""
+    import random
+    rng = random.Random(seed)
+    n = len(predictions)
+    if n == 0:
+        return None, None
+    aucs = []
+    for _ in range(n_iter):
+        idx = [rng.randrange(n) for _ in range(n)]
+        p = [predictions[i] for i in idx]
+        l = [labels[i] for i in idx]
+        if sum(l) == 0 or sum(l) == len(l):
+            continue
+        _, auc = _roc_curve(p, l)
+        if auc is not None:
+            aucs.append(auc)
+    if len(aucs) < 10:
+        return None, None
+    aucs.sort()
+    return round(aucs[int(len(aucs) * 0.025)], 4), round(aucs[int(len(aucs) * 0.975)], 4)
+
+
+def _expected_calibration_error(bins):
+    """ECE: sum_b (n_b/n_total) * |observed_b - predicted_b|"""
+    total = sum(b.get("n", 0) for b in bins)
+    if total == 0:
+        return None
+    ece = 0.0
+    for b in bins:
+        if b.get("n", 0) == 0 or b.get("observed_rate") is None:
+            continue
+        ece += (b["n"] / total) * abs(b["observed_rate"] - b["mean_predicted"])
+    return round(ece, 4)
+
+
+def _logrank_p(groups):
+    """
+    İki+ grup için Mantel-Cox log-rank testi (chi-square yaklaşımı).
+    groups: list of dicts {events: [t...], censored: [t...], n0: int}
+    Return: p_value (None if <2 groups veya hesaplanamıyorsa)
+    """
+    import math
+    if len(groups) < 2:
+        return None
+    # Tüm benzersiz olay zamanları
+    event_times = sorted(set(t for g in groups for t in g["events"]))
+    if not event_times:
+        return None
+    # Her grupta her zamandaki risk altı (n_at_risk)
+    def n_at_risk(g, t):
+        dead = sum(1 for x in g["events"] if x < t)
+        cens = sum(1 for x in g["censored"] if x < t)
+        return max(0, g["n0"] - dead - cens)
+
+    # Observed - Expected per grup
+    n_groups = len(groups)
+    O_minus_E = [0.0] * n_groups
+    var = [[0.0] * n_groups for _ in range(n_groups)]
+
+    for t in event_times:
+        n_total = sum(n_at_risk(g, t) for g in groups)
+        if n_total <= 1:
+            continue
+        d_total = sum(sum(1 for x in g["events"] if x == t) for g in groups)
+        if d_total == 0:
+            continue
+        for i, g in enumerate(groups):
+            n_i = n_at_risk(g, t)
+            d_i = sum(1 for x in g["events"] if x == t)
+            e_i = d_total * n_i / n_total
+            O_minus_E[i] += d_i - e_i
+            v = (d_total * n_i * (n_total - n_i) * (n_total - d_total)) / (n_total ** 2 * (n_total - 1)) if n_total > 1 else 0
+            var[i][i] += v
+
+    # Chi-square = sum (O-E)^2 / Var, df = k-1 (basit yaklaşım — k=2 için kesin)
+    # k=2'de chi-sq = (O1-E1)^2 / V11
+    if n_groups == 2:
+        v = var[0][0]
+        if v <= 0:
+            return None
+        chi2 = (O_minus_E[0] ** 2) / v
+        df = 1
+    else:
+        # k>2 için her grup için ayrı chi-square topla (yaklaşık)
+        chi2 = 0.0
+        for i in range(n_groups):
+            if var[i][i] > 0:
+                chi2 += (O_minus_E[i] ** 2) / var[i][i]
+        df = n_groups - 1
+
+    # P(chi2 >= x | df) — basit serisi: regularized upper incomplete gamma
+    # 1 - F(x; df/2) where F is gamma CDF. Wilson-Hilferty yaklaşımı (df>=1 için iyi).
+    if chi2 <= 0:
+        return 1.0
+    h = 2 / (9 * df)
+    z = ((chi2 / df) ** (1/3) - (1 - h)) / math.sqrt(h)
+    # Normal survival fonksiyonu erfc
+    p = 0.5 * math.erfc(z / math.sqrt(2))
+    return round(max(0.0, min(1.0, p)), 6)
+
+
+@app.get("/api/science/performance")
+async def science_performance(current_user: User = Depends(get_current_user)):
+    """Tek seferde tüm performans metrikleri: C-index, AUC-6m, Brier, ECE, n."""
+    recs = _load_outcome_records()
+    n_total = len(recs)
+    n_events = sum(r["event"] for r in recs)
+    n_with_pred = sum(1 for r in recs if r["pred_6m"] is not None)
+
+    # C-index (risk_score üzerinden)
+    c_index = _harrell_c_index([r for r in recs if r["risk_score"] is not None], "risk_score")
+
+    # 6m AUC
+    preds = [r["pred_6m"] for r in recs if r["pred_6m"] is not None]
+    # AUC için outcome: 6 ay sağkalım var mı (1=evet, 0=hayır)
+    labels_6m = [r["survived_180d"] for r in recs if r["pred_6m"] is not None]
+    _, auc_6m = _roc_curve(preds, labels_6m)
+    auc_6m_lo, auc_6m_hi = _bootstrap_auc(preds, labels_6m) if auc_6m else (None, None)
+
+    # Brier — survived_180d gerçek, pred 0..1
+    brier = None
+    if preds:
+        brier = round(sum((p - o) ** 2 for p, o in zip(preds, labels_6m)) / len(preds), 4)
+
+    # ECE — 10 binli reliability'den hesapla
+    ece = None
+    if preds:
+        bins_def = [(i * 0.1, (i + 1) * 0.1) for i in range(10)]
+        binned = []
+        for lo, hi in bins_def:
+            inb = [(p, o) for p, o in zip(preds, labels_6m) if lo <= p < hi or (hi == 1.0 and p == 1.0)]
+            if inb:
+                mean_p = sum(p for p, _ in inb) / len(inb)
+                obs = sum(o for _, o in inb) / len(inb)
+                binned.append({"mean_predicted": mean_p, "observed_rate": obs, "n": len(inb)})
+        ece = _expected_calibration_error(binned)
+
+    # Calibration JSON'dan CV doğruluğu
+    cal = {}
+    cal_path = BASE_DIR / "model_calibration.json"
+    if cal_path.exists():
+        try:
+            with open(cal_path, "r", encoding="utf-8") as f:
+                cal = json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "n_total": n_total,
+        "n_with_prediction": n_with_pred,
+        "n_events": n_events,
+        "n_censored": n_total - n_events,
+        "c_index": c_index,
+        "auc_6m": auc_6m,
+        "auc_6m_ci": [auc_6m_lo, auc_6m_hi] if auc_6m_lo and auc_6m_hi else None,
+        "brier_6m": brier,
+        "ece_6m": ece,
+        "cv_accuracy_6m": cal.get("model_6m", {}).get("cv_accuracy"),
+        "cv_accuracy_12m": cal.get("model_12m", {}).get("cv_accuracy"),
+        "risk_model_r2": cal.get("risk_model", {}).get("r2"),
+        "model_version": "v5.0-bootstrap95",
+        "training_n": cal.get("n_patients"),
+        "calibration_date": cal.get("calibration_date"),
+    }
+
+
+@app.get("/api/science/roc")
+async def science_roc(current_user: User = Depends(get_current_user)):
+    """6 aylık sağkalım için ROC eğrisi noktaları + AUC + 95% CI."""
+    recs = _load_outcome_records()
+    preds = [r["pred_6m"] for r in recs if r["pred_6m"] is not None]
+    labels = [r["survived_180d"] for r in recs if r["pred_6m"] is not None]
+    if not preds or sum(labels) == 0 or sum(labels) == len(labels):
+        return {"points": [], "auc": None, "n": 0, "n_positive": 0,
+                "note": "ROC için 6 ay sağkalımı bilinen + tahmini olan en az 1 pozitif/negatif örnek gerekir"}
+    pts, auc = _roc_curve(preds, labels)
+    lo, hi = _bootstrap_auc(preds, labels)
+    return {
+        "points": [{"fpr": round(p[0], 4), "tpr": round(p[1], 4), "threshold": round(p[2], 4)} for p in pts],
+        "auc": auc, "auc_ci": [lo, hi] if lo and hi else None,
+        "n": len(preds), "n_positive": sum(labels),
+        "outcome": "6 aylık sağkalım (≥180 gün)",
+    }
+
+
+@app.get("/api/science/feature-effects")
+async def science_feature_effects(current_user: User = Depends(get_current_user)):
+    """
+    Risk modeli (linear regression) özniteliklerinin etkisi.
+    model_calibration.json'daki coef'ler standartlaştırılmış (z-score) özniteliklere
+    ait olduğundan, |coef|'in büyüklüğü doğrudan göreceli önem demek.
+    Bootstrap CI eğitim verisi yokken hesaplanamaz; coefin ±SE'sini sunarız.
+    """
+    cal_path = BASE_DIR / "model_calibration.json"
+    if not cal_path.exists():
+        return {"features": [], "note": "Kalibrasyon dosyası yok"}
+    try:
+        with open(cal_path, "r", encoding="utf-8") as f:
+            cal = json.load(f)
+    except Exception:
+        return {"features": [], "note": "Kalibrasyon dosyası okunamadı"}
+
+    names = cal.get("feature_names", [])
+    risk = cal.get("risk_model", {})
+    coefs = risk.get("coef", [])
+    coef_6m = cal.get("model_6m", {}).get("coef", [])
+    coef_12m = cal.get("model_12m", {}).get("coef", [])
+
+    label_tr = {
+        "age": "Yaş",
+        "gender_male": "Cinsiyet: Erkek",
+        "mgmt_methylated": "MGMT: Metile",
+        "mgmt_unmethylated": "MGMT: Metile Değil",
+        "idh_mutant": "IDH1: Mutant",
+        "idh_wildtype": "IDH1: Wildtype",
+        "log_tumor_vol": "log(Tümör Hacmi)",
+        "core_ratio": "Necrotic / Whole oranı",
+        "enh_ratio": "Enhancing / Whole oranı",
+    }
+
+    features = []
+    skipped_zero = []
+    for i, name in enumerate(names):
+        risk_coef = float(coefs[i]) if i < len(coefs) else 0
+        s6 = float(coef_6m[i]) if i < len(coef_6m) else 0
+        s12 = float(coef_12m[i]) if i < len(coef_12m) else 0
+        # Eğitim verisinde varyans=0 olan özniteliklerin coefi ≈0 olur (örn. IDH mutant
+        # olmayan kohort). Bunları forest plot'tan dışla — yanıltıcı görünmesin.
+        if abs(risk_coef) < 0.01 and abs(s6) < 0.01:
+            skipped_zero.append(label_tr.get(name, name))
+            continue
+        features.append({
+            "name": name,
+            "label": label_tr.get(name, name),
+            "risk_coef": round(risk_coef, 4),
+            "log_or_6m": round(s6, 4),
+            "log_or_12m": round(s12, 4),
+            "odds_ratio_6m": round(float(math.exp(s6)), 3) if s6 else 1.0,
+            "odds_ratio_12m": round(float(math.exp(s12)), 3) if s12 else 1.0,
+            "direction": "high_risk" if risk_coef > 0 else "low_risk",
+        })
+    features.sort(key=lambda x: -abs(x["risk_coef"]))
+    return {
+        "features": features,
+        "skipped_zero_variance": skipped_zero,
+        "model_r2": risk.get("r2"),
+        "cv_acc_6m": cal.get("model_6m", {}).get("cv_accuracy"),
+        "cv_acc_12m": cal.get("model_12m", {}).get("cv_accuracy"),
+        "training_n": cal.get("n_patients"),
+        "note": "Coefler standartlaştırılmış özniteliklerin risk skoru/logit üzerindeki katkısı. "
+                "Hazard ratio değildir; logistic 6m/12m için OR olarak yorumlanabilir."
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2181,49 +2676,6 @@ async def patient_timeline(patient_id: str):
 
         timeline.sort(key=lambda e: e.get("date") or "9999")
         return {"patient_id": patient_id, "timeline": timeline, "volume_data": volume_data}
-    finally:
-        db.close()
-
-
-@app.get("/api/compare")
-async def compare_patients(ids: str = ""):
-    if not ids:
-        raise HTTPException(400, "ids parametresi gerekli")
-    patient_ids = [pid.strip() for pid in ids.split(",") if pid.strip()]
-    if len(patient_ids) < 2:
-        raise HTTPException(400, "En az 2 hasta ID gerekli")
-    if len(patient_ids) > 5:
-        raise HTTPException(400, "En fazla 5 hasta karşılaştırılabilir")
-
-    db = SessionLocal()
-    try:
-        results = []
-        for pid in patient_ids:
-            patient = db.query(Patient).filter(Patient.patient_id == pid).first()
-            if not patient:
-                continue
-            latest = db.query(Analysis).filter(Analysis.patient_pk == patient.id).order_by(Analysis.created_at.desc()).first()
-            treatments = db.query(Treatment).filter(Treatment.patient_pk == patient.id).order_by(Treatment.start_date).all()
-            results.append({
-                "patient_id": patient.patient_id, "age": patient.age, "gender": patient.gender,
-                "kps_score": patient.kps_score, "mgmt_status": patient.mgmt_status,
-                "idh1_status": patient.idh1_status, "treatment_protocol": patient.treatment_protocol,
-                "diagnosis_date": patient.diagnosis_date.isoformat() if patient.diagnosis_date else None,
-                "tumor_location": patient.tumor_location, "surgery_type": patient.surgery_type,
-                "risk_score": latest.risk_score if latest else None,
-                "risk_class": latest.risk_class if latest else None,
-                "risk_label": latest.risk_label if latest else None,
-                "survival_6m_pct": latest.survival_6m_pct if latest else None,
-                "tumor_volume": latest.tumor_volume_cm3 if latest else None,
-                "core_volume": latest.core_volume_cm3 if latest else None,
-                "enhancing_volume": latest.enhancing_volume_cm3 if latest else None,
-                "edema_volume": latest.edema_volume_cm3 if latest else None,
-                "sphericity": latest.sphericity if latest else None,
-                "surface_area": latest.surface_area_cm2 if latest else None,
-                "treatments": [{"drug_name": t.drug_name, "start_date": t.start_date.isoformat() if t.start_date else None,
-                                "dosage": t.dosage, "response": t.response} for t in treatments],
-            })
-        return {"patients": results}
     finally:
         db.close()
 

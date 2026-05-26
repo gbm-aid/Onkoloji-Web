@@ -151,59 +151,49 @@ function MRIViewer({ axis, slice, maxSlice, segOverlay, onAxisChange, onSliceCha
         || files.find(f => (f.filename || '').toLowerCase().includes(wanted))
         || null;
   };
-  const segFile = hasReal ? files.find(f => {
+  // Modality-aware seg picker: prefer native-space per-modality seg so the
+  // overlay aligns voxel-wise with the MR being shown. Falls back to any seg.
+  // E.g., viewing CT1.nii.gz → ct1_seg_mask.nii.gz; T1.nii.gz → t1_seg_mask, etc.
+  const isSegFile = (f) => {
     const m = (f.modality || '').toUpperCase();
     const n = (f.filename || '').toLowerCase();
-    return m === 'SEG' || m.startsWith('MASK') || n.includes('seg') || n.includes('mask') || n.includes('whole') || n.includes('core') || n.includes('enh');
-  }) : null;
+    return m === 'SEG' || m.startsWith('MASK')
+        || n.includes('seg') || n.includes('mask')
+        || n.includes('whole') || n.includes('core') || n.includes('enh');
+  };
+  const allSegs = hasReal ? files.filter(isSegFile) : [];
+
+  const pickSegFor = (mainFilename) => {
+    if (!allSegs.length) return null;
+    const main = (mainFilename || '').toLowerCase();
+    // LUMIERE convention: ct1_seg_mask.nii.gz ↔ CT1.nii.gz, t1_seg_mask ↔ T1.nii.gz...
+    const wantedPrefix = (
+      main.startsWith('ct1')   ? 'ct1_' :
+      main.startsWith('flair') ? 'flair_' :
+      main.startsWith('t1c')   ? 'ct1_' :
+      main.startsWith('t1')    ? 't1_' :
+      main.startsWith('t2')    ? 't2_' : null
+    );
+    if (wantedPrefix) {
+      const match = allSegs.find(s => (s.filename || '').toLowerCase().startsWith(wantedPrefix));
+      if (match) return match;
+    }
+    return allSegs[0];
+  };
+  const segFile = hasReal ? pickSegFor(findFile(activeMod)?.filename) : null;
 
   const buildRealUrl = (mod, ax, sl) => {
     const f = findFile(mod);
     if (!f) return null;
-    const overlays = segOn && segFile && segFile.filename !== f.filename ? [segFile.filename] : [];
+    const seg = pickSegFor(f.filename);
+    const overlays = segOn && seg && seg.filename !== f.filename ? [seg.filename] : [];
     return window.GBM_API
       ? window.GBM_API.getSliceUrl(sessionId, f.filename, ax, sl, overlays)
       : null;
   };
 
-  const W = 360, H = 360;
-
-  // Sentetik fallback için canvas
-  React.useEffect(() => {
-    if (layout !== 'single') return;
-    if (hasReal && !realImgErr[activeMod]) return; // gerçek img kullanılıyor
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    canvas.width = W; canvas.height = H;
-    renderBrainSlice(ctx, W, H, {
-      axis, slice, maxSlice, modality: activeMod,
-      segOverlay: segOn,
-      windowLevel: { window: windowVal, level: levelVal },
-      showCrosshair
-    });
-  }, [axis, slice, maxSlice, activeMod, segOn, windowVal, levelVal, showCrosshair, layout, hasReal, realImgErr]);
-
-  // Multi-axis render
   const multiRefs = { axial: React.useRef(), coronal: React.useRef(), sagittal: React.useRef() };
   const maxSlices = { axial: 154, coronal: 239, sagittal: 239 };
-  React.useEffect(() => {
-    if (layout !== 'multi') return;
-    if (hasReal && !realImgErr[activeMod]) return; // <img> ile gösterilecek
-    Object.keys(multiRefs).forEach(ax => {
-      const c = multiRefs[ax].current;
-      if (!c) return;
-      const ctx = c.getContext('2d');
-      c.width = 180; c.height = 180;
-      const s = ax === axis ? slice : Math.floor(maxSlices[ax] / 2);
-      renderBrainSlice(ctx, 180, 180, {
-        axis: ax, slice: s, maxSlice: maxSlices[ax], modality: activeMod,
-        segOverlay: segOn,
-        windowLevel: { window: windowVal, level: levelVal },
-        showCrosshair: ax === axis
-      });
-    });
-  }, [layout, axis, slice, activeMod, segOn, windowVal, levelVal, hasReal, realImgErr]);
 
   const axisLabel = { axial: 'AX', coronal: 'COR', sagittal: 'SAG' }[axis] || 'AX';
 
@@ -214,59 +204,80 @@ function MRIViewer({ axis, slice, maxSlice, segOverlay, onAxisChange, onSliceCha
   const realActive = hasReal && !realImgErr[activeMod];
   const singleUrl = realActive ? buildRealUrl(activeMod, axis, slice) : null;
 
+  // "MRI yok" placeholder
+  const NoMriPlaceholder = React.createElement('div', {
+    style: {
+      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      height: 340, background: '#0a0a12', borderRadius: 6, gap: 14, padding: 32
+    }
+  },
+    React.createElement('div', {
+      style: {
+        width: 72, height: 72, borderRadius: '50%',
+        border: '2px dashed rgba(255,255,255,0.15)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: 28, color: 'rgba(255,255,255,0.2)'
+      }
+    }, '⊘'),
+    React.createElement('div', { style: { color: 'rgba(255,255,255,0.55)', fontSize: 13, fontWeight: 600, textAlign: 'center' } },
+      'MRI dosyası yüklenmemiş'),
+    React.createElement('div', { style: { color: 'rgba(255,255,255,0.3)', fontSize: 11.5, textAlign: 'center', maxWidth: 260, lineHeight: 1.6 } },
+      'Analiz formundan T1, T2, FLAIR ve T1c NIfTI dosyalarını yükleyerek gerçek MRI görüntülemeyi etkinleştirin.')
+  );
+
   return React.createElement('div', { className: 'viewer-container' },
     layout === 'single'
       ? React.createElement('div', { className: 'viewer-image-wrap', style: { position: 'relative' } },
-          singleUrl
-            ? React.createElement('img', {
-                src: singleUrl,
-                alt: 'MRI slice',
-                draggable: false,
-                onError: () => setRealImgErr(s => ({ ...s, [activeMod]: true })),
-                style: {
-                  width: '100%', height: '100%', objectFit: 'contain',
-                  background: '#000', filter: wlFilter,
-                  imageRendering: 'auto', userSelect: 'none'
-                }
-              })
-            : React.createElement('canvas', { ref: canvasRef, style: { width: '100%', height: '100%', objectFit: 'contain' } }),
-          showLabels && React.createElement(React.Fragment, null,
+          !hasReal
+            ? NoMriPlaceholder
+            : singleUrl
+              ? React.createElement('img', {
+                  src: singleUrl,
+                  alt: 'MRI slice',
+                  draggable: false,
+                  onError: () => setRealImgErr(s => ({ ...s, [activeMod]: true })),
+                  style: {
+                    width: '100%', height: '100%', objectFit: 'contain',
+                    background: '#000', filter: wlFilter,
+                    imageRendering: 'auto', userSelect: 'none'
+                  }
+                })
+              : React.createElement('div', {
+                  style: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: 340, background: '#0a0a12', color: 'rgba(255,255,255,0.4)', fontSize: 12 }
+                }, activeMod + ' verisi yüklenemedi'),
+          hasReal && showLabels && React.createElement(React.Fragment, null,
             React.createElement('span', { className: 'viewer-overlay tl' }, `${axisLabel} ${slice} / ${maxSlice}`),
             React.createElement('span', { className: 'viewer-overlay tr' },
-              realActive ? (findFile(activeMod)?.filename || 'NIfTI') : '155 × 240 × 240'),
+              realActive ? (findFile(activeMod)?.filename || 'NIfTI') : ''),
             React.createElement('span', { className: 'viewer-overlay bl' },
               `W ${(windowVal * 100).toFixed(0)} · L ${(levelVal * 100).toFixed(0)}`),
-            segOn && React.createElement('span', { className: 'viewer-overlay br' },
-              realActive ? (segFile ? 'SEG: ' + segFile.filename : 'SEG yok') : 'SEG: seg_mask'),
-            realActive && React.createElement('span', {
-              className: 'viewer-overlay',
-              style: { top: 8, left: '50%', transform: 'translateX(-50%)',
-                       background: 'rgba(13,148,136,0.85)', color: '#fff',
-                       padding: '2px 8px', borderRadius: 3, fontSize: 10,
-                       letterSpacing: 0.5, fontWeight: 700 }
-            }, 'GERÇEK NIfTI')
+            segOn && segFile && React.createElement('span', { className: 'viewer-overlay br' },
+              'SEG: ' + segFile.filename)
           )
         )
       : React.createElement('div', { className: 'multi-axis-grid' },
-          ['axial', 'coronal', 'sagittal'].map(ax => {
-            const s = ax === axis ? slice : Math.floor(maxSlices[ax] / 2);
-            const url = realActive ? buildRealUrl(activeMod, ax, s) : null;
-            return React.createElement('div', { key: ax,
-              className: 'multi-axis-cell ' + (axis === ax ? 'active' : ''),
-              onClick: () => onAxisChange(ax)
-            },
-              url
-                ? React.createElement('img', {
-                    src: url, alt: ax,
-                    onError: () => setRealImgErr(st => ({ ...st, [activeMod]: true })),
-                    style: { width: '100%', height: '100%', objectFit: 'contain', background: '#000', filter: wlFilter }
-                  })
-                : React.createElement('canvas', { ref: multiRefs[ax] }),
-              React.createElement('div', { className: 'multi-axis-label' },
-                { axial: 'AKSİYEL', coronal: 'KORONAL', sagittal: 'SAGİTTAL' }[ax],
-                ' · ', s + '/' + maxSlices[ax])
-            );
-          }),
+          !hasReal
+            ? React.createElement('div', { style: { gridColumn: '1 / -1', display: 'flex', alignItems: 'center', justifyContent: 'center', height: 220, color: 'rgba(255,255,255,0.35)', fontSize: 13 } },
+                'MRI dosyası yüklenmemiş')
+            : ['axial', 'coronal', 'sagittal'].map(ax => {
+                const s = ax === axis ? slice : Math.floor(maxSlices[ax] / 2);
+                const url = realActive ? buildRealUrl(activeMod, ax, s) : null;
+                return React.createElement('div', { key: ax,
+                  className: 'multi-axis-cell ' + (axis === ax ? 'active' : ''),
+                  onClick: () => onAxisChange(ax)
+                },
+                  url
+                    ? React.createElement('img', {
+                        src: url, alt: ax,
+                        onError: () => setRealImgErr(st => ({ ...st, [activeMod]: true })),
+                        style: { width: '100%', height: '100%', objectFit: 'contain', background: '#000', filter: wlFilter }
+                      })
+                    : React.createElement('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'rgba(255,255,255,0.3)', fontSize: 11 } }, 'Yüklenemedi'),
+                  React.createElement('div', { className: 'multi-axis-label' },
+                    { axial: 'AKSİYEL', coronal: 'KORONAL', sagittal: 'SAGİTTAL' }[ax],
+                    ' · ', s + '/' + maxSlices[ax])
+                );
+              }),
           React.createElement('div', { className: 'multi-axis-cell', style: { background: '#050510' } },
             React.createElement('div', { style: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'rgba(255,255,255,0.4)', fontSize: 11, fontFamily: 'var(--mono)', gap: 6 } },
               React.createElement('div', { style: { fontWeight: 700, fontSize: 13, color: 'rgba(255,255,255,0.6)' } }, activeMod),
@@ -275,7 +286,7 @@ function MRIViewer({ axis, slice, maxSlice, segOverlay, onAxisChange, onSliceCha
             )
           )
         ),
-    React.createElement('div', { className: 'viewer-controls' },
+    hasReal && React.createElement('div', { className: 'viewer-controls' },
       // Row 1: Axis + Modality
       React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 } },
         layout === 'single' && React.createElement('div', { className: 'viewer-axis-btns' },
@@ -338,7 +349,7 @@ function MRIViewer({ axis, slice, maxSlice, segOverlay, onAxisChange, onSliceCha
           '↺ Sıfırla')
       )
     ),
-    segOn && layout === 'single' && React.createElement('div', { className: 'viewer-legend' },
+    hasReal && segOn && layout === 'single' && React.createElement('div', { className: 'viewer-legend' },
       React.createElement('div', { className: 'legend-item' },
         React.createElement('div', { className: 'legend-swatch', style: { background: '#dc2626' } }), 'Enhancing'),
       React.createElement('div', { className: 'legend-item' },

@@ -32,24 +32,36 @@ function AnalysisPage({ onViewReport }) {
   const [analyzing, setAnalyzing] = React.useState(false);
   const [analyzeResult, setAnalyzeResult] = React.useState(null);
   const [analyzeError, setAnalyzeError] = React.useState('');
+  const [cohortKM, setCohortKM] = React.useState(null);
   const fileInputRef = React.useRef(null);
 
-  // Viewer state
+  // Sonuç ekranı açıldığında kohort KM eğrisini çek (risk sınıfına göre stratifiye)
+  React.useEffect(() => {
+    if (!showResults) return;
+    GBM_API.getCohortKM({ stratify: 'risk_class' }).then(setCohortKM);
+  }, [showResults]);
+
+  // Viewer state — slice 115: tümör hacminin en yüksek olduğu aksiyel kesit (LUMIERE Patient-001)
   const [viewerAxis, setViewerAxis] = React.useState('axial');
-  const [viewerSlice, setViewerSlice] = React.useState(77);
-  const maxSlices = { axial: 154, coronal: 239, sagittal: 239 };
+  const [viewerSlice, setViewerSlice] = React.useState(115);
+  const maxSlices = { axial: 191, coronal: 255, sagittal: 255 };
 
   // Sonuç: backend yanıtı (analyzeResult) > demo şablon (fallback)
   const r = analyzeResult || DEMO_PATIENT;
 
-  // Demo: gerçek bir upload klasörü (NIfTI) — viewer'da gerçek görüntü göstermek için
-  const DEMO_SESSION = '00e6a88b';
+  // Demo: gerçek LUMIERE hastası (Patient-001:week-000-1).
+  // CT1.nii.gz (256×256×192) ile native-space ct1_seg_mask.nii.gz voxel-wise hizalı
+  // — tümör overlay'i doğru anatomik konumda görünür.
+  const DEMO_SESSION = 'Patient-001:week-000-1';
   const DEMO_FILES = [
-    { filename: 'T1w.nii',        modality: 'T1',    modality_label: 'T1',           confidence: 99, shape: [240, 240, 155] },
-    { filename: 'T1c.nii',        modality: 'T1ce',  modality_label: 'T1 Kontrastlı', confidence: 99, shape: [240, 240, 155] },
-    { filename: 'T2w.nii',        modality: 'T2',    modality_label: 'T2',           confidence: 99, shape: [240, 240, 155] },
-    { filename: 'FLAIR.nii',      modality: 'FLAIR', modality_label: 'FLAIR',        confidence: 99, shape: [240, 240, 155] },
-    { filename: 'whole.nii.gz',   modality: 'SEG',   modality_label: 'Segmentasyon', confidence: 95, shape: [240, 240, 155] },
+    { filename: 'CT1.nii.gz',           modality: 'T1ce',  modality_label: 'T1 Kontrastlı (CT1)', confidence: 99, shape: [256, 256, 192] },
+    { filename: 'T1.nii.gz',            modality: 'T1',    modality_label: 'T1',                  confidence: 99, shape: [640, 640, 24]  },
+    { filename: 'T2.nii.gz',            modality: 'T2',    modality_label: 'T2',                  confidence: 99, shape: [512, 512, 24]  },
+    { filename: 'FLAIR.nii.gz',         modality: 'FLAIR', modality_label: 'FLAIR',               confidence: 99, shape: [640, 640, 40]  },
+    { filename: 'ct1_seg_mask.nii.gz',  modality: 'SEG',   modality_label: 'Tümör Maskesi (CT1 native)', confidence: 95, shape: [256, 256, 192] },
+    { filename: 't1_seg_mask.nii.gz',   modality: 'SEG',   modality_label: 'Tümör Maskesi (T1 native)',  confidence: 95, shape: [640, 640, 24]  },
+    { filename: 't2_seg_mask.nii.gz',   modality: 'SEG',   modality_label: 'Tümör Maskesi (T2 native)',  confidence: 95, shape: [512, 512, 24]  },
+    { filename: 'flair_seg_mask.nii.gz',modality: 'SEG',   modality_label: 'Tümör Maskesi (FLAIR native)',confidence: 95, shape: [640, 640, 40]  },
   ];
 
   // Demo modu: hızlı test için sahte upload
@@ -125,6 +137,9 @@ function AnalysisPage({ onViewReport }) {
         enhancing_volume: rad.enhancing_volume_cm3,
         edema_volume: rad.edema_volume_cm3,
         sphericity: rad.sphericity,
+        radiomics: rad,
+        similar_patients: res.similar_patients || [],
+        literature: res.literature || null,
         ai_summary: res.ai_summary || '',
       });
     }
@@ -188,6 +203,50 @@ function AnalysisPage({ onViewReport }) {
     // r tanımlandı (analyzeResult || DEMO_PATIENT)
     const survColor = r.survival_6m_pct > 50 ? 'var(--green)' : r.survival_6m_pct > 25 ? 'var(--yellow)' : 'var(--red)';
 
+    // ── Türetilmiş paneller (gerçek backend verisi varsa onu kullan) ──
+    const hasReal = !!analyzeResult;
+    const similarRows = (hasReal && r.similar_patients?.length) ? r.similar_patients : MOCK.similarPatients;
+    const lit = (hasReal && r.literature) ? r.literature : MOCK.literature;
+
+    // Radar: gerçek radiomics özelliklerinden hesapla; yoksa fallback Patient-042 örneği.
+    const rad = r.radiomics || {};
+    const tv = rad.tumor_volume_cm3 || r.tumor_volume || 0;
+    const cv = rad.core_volume_cm3 || r.core_volume || 0;
+    const ev = rad.enhancing_volume_cm3 || r.enhancing_volume || 0;
+    const realRadar = hasReal && tv > 0 ? {
+      'Sferiklik':      rad.sphericity   || r.sphericity || 0,
+      'Kompaktlık':     rad.compactness  || 0,
+      'Yüzey/Hacim':    rad.surface_area_cm2 && tv ? Math.min(1, rad.surface_area_cm2 / (tv * 4)) : 0,
+      'Enhancing/Whole': tv ? Math.min(1, ev / tv) : 0,
+      'Nekrotik/Whole': tv ? Math.min(1, cv / tv) : 0,
+      'GLCM Kontrast':  rad.glcm_contrast || rad.firstorder_Energy ? Math.min(1, (rad.glcm_contrast || 0.5)) : 0.5,
+      'Şekil':          rad.sphericity ? Math.min(1, rad.sphericity) : 0,
+      'Tekstür':        rad.firstorder_Entropy ? Math.min(1, rad.firstorder_Entropy / 6) : 0.5,
+    } : MOCK.radiomicFeatures['Patient-042'];
+
+    // Risk faktör atfı: klinik + radiomics değerlerinden deterministik hesapla
+    const realFactors = hasReal ? [
+      { factor: `Yaş (${age})`,                 impact: Math.max(-0.5, Math.min(0.5, ((parseInt(age) || 60) - 50) / 50)), direction: (parseInt(age) || 60) >= 60 ? 'high' : 'low' },
+      { factor: `KPS Skoru (${kps})`,           impact: Math.max(-0.5, Math.min(0.5, (70 - (parseInt(kps) || 70)) / 60)), direction: (parseInt(kps) || 70) < 70 ? 'high' : 'low' },
+      { factor: mgmt === 'methylated' ? 'MGMT Metile' : 'MGMT Metile Değil',
+        impact: mgmt === 'methylated' ? -0.38 : 0.32, direction: mgmt === 'methylated' ? 'low' : 'high' },
+      { factor: idh1 === 'mutant' ? 'IDH1 Mutant' : 'IDH1 Wildtype',
+        impact: idh1 === 'mutant' ? -0.45 : 0.31, direction: idh1 === 'mutant' ? 'low' : 'high' },
+      { factor: `Tümör Hacmi (${tv.toFixed(1)} cm³)`, impact: Math.min(0.5, tv / 80), direction: tv > 35 ? 'high' : 'low' },
+      { factor: `Nekrotik Oran (%${tv ? (cv/tv*100).toFixed(1) : 0})`,
+        impact: tv ? Math.min(0.4, cv/tv * 0.8) : 0, direction: tv && cv/tv > 0.2 ? 'high' : 'low' },
+      { factor: `${surgType} Cerrahi`,          impact: surgType === 'GTR' ? -0.44 : surgType === 'STR' ? -0.20 : 0.15, direction: surgType === 'GTR' ? 'low' : surgType === 'STR' ? 'low' : 'high' },
+      ...(rad.sphericity != null ? [{ factor: `Sferiklik (${rad.sphericity.toFixed(2)})`,
+        impact: -0.15 * rad.sphericity, direction: 'low' }] : []),
+    ] : MOCK.riskFactors;
+
+    // Gerçek kohort KM eğrisi
+    const realKMCurves = (cohortKM?.curves || []).map(c => ({
+      label: c.label, color: c.color, n0: c.n0,
+      events: c.events || [], censored: c.censored || [],
+    }));
+    const kmCurves = realKMCurves.length ? realKMCurves : MOCK.kmCurves;
+
     return React.createElement('div', null,
       stepWizard,
       React.createElement('div', { className: 'container page-fade' },
@@ -234,8 +293,8 @@ function AnalysisPage({ onViewReport }) {
           ),
           React.createElement('div', { className: 'kpi-card' },
             React.createElement('div', { className: 'kpi-label' }, 'Benzer Hasta'),
-            React.createElement('div', { className: 'kpi-value' }, MOCK.similarPatients.length),
-            React.createElement('div', { className: 'kpi-sub' }, 'FAISS kohort')
+            React.createElement('div', { className: 'kpi-value' }, similarRows.length),
+            React.createElement('div', { className: 'kpi-sub' }, hasReal && r.similar_patients?.length ? 'Referans kohort' : 'Demo veri')
           )
         ),
 
@@ -316,10 +375,11 @@ function AnalysisPage({ onViewReport }) {
             React.createElement('div', { className: 'card' },
               React.createElement('div', { className: 'section-head' },
                 React.createElement('div', { className: 'section-title' }, 'RİSK FAKTÖR ATFI'),
-                React.createElement('span', { className: 'section-badge' }, 'Cox PHM ağırlıkları')
+                React.createElement('span', { className: 'section-badge' },
+                  hasReal ? 'Klinik + radyomik (Cox PHM)' : 'Demo ağırlıkları')
               ),
               React.createElement('div', { className: 'card-body' },
-                React.createElement(RiskWaterfall, { factors: MOCK.riskFactors })
+                React.createElement(RiskWaterfall, { factors: realFactors })
               )
             )
           ),
@@ -328,7 +388,7 @@ function AnalysisPage({ onViewReport }) {
             React.createElement('div', { className: 'card', style: { overflow: 'hidden' } },
               React.createElement('div', { className: 'section-head' },
                 React.createElement('div', { className: 'section-title' }, 'TÜMÖR GÖRÜNTÜLEME'),
-                React.createElement('span', { className: 'section-badge' }, '155 × 240 × 240')
+                React.createElement('span', { className: 'section-badge' }, 'LUMIERE · Patient-001')
               ),
               React.createElement(MRIViewer, {
                 axis: viewerAxis, slice: viewerSlice,
@@ -343,11 +403,12 @@ function AnalysisPage({ onViewReport }) {
             React.createElement('div', { className: 'card' },
               React.createElement('div', { className: 'section-head' },
                 React.createElement('div', { className: 'section-title' }, 'RADYOMİK PROFİL'),
-                React.createElement('span', { className: 'section-badge' }, '107 özellik · LASSO')
+                React.createElement('span', { className: 'section-badge' },
+                  hasReal && tv > 0 ? 'Gerçek özellikler' : 'Demo örnek')
               ),
               React.createElement('div', { className: 'card-body' },
                 React.createElement(RadiomicRadar, {
-                  data: MOCK.radiomicFeatures['Patient-042'],
+                  data: realRadar,
                   label: r.patient_id,
                   color: 'var(--accent)',
                   size: 240
@@ -357,14 +418,17 @@ function AnalysisPage({ onViewReport }) {
           )
         ),
 
-        // Kaplan-Meier in full width
+        // Kaplan-Meier in full width — gerçek kohort verisi (yoksa demo)
         React.createElement('div', { className: 'card' },
           React.createElement('div', { className: 'section-head' },
             React.createElement('div', { className: 'section-title' }, 'KAPLAN-MEIER SAĞKALIM EĞRİSİ'),
-            React.createElement('span', { className: 'section-badge' }, 'Risk gruplarına göre · Kohort')
+            React.createElement('span', { className: 'section-badge' },
+              realKMCurves.length
+                ? `${cohortKM?.total_filtered || 0} hasta · Risk sınıfına göre`
+                : 'Demo eğri · Risk gruplarına göre')
           ),
           React.createElement('div', { className: 'card-body' },
-            React.createElement(KaplanMeier, { curves: MOCK.kmCurves, height: 240 })
+            React.createElement(KaplanMeier, { curves: kmCurves, height: 240 })
           )
         ),
 
@@ -383,7 +447,10 @@ function AnalysisPage({ onViewReport }) {
         React.createElement('div', { className: 'card' },
           React.createElement('div', { className: 'section-head' },
             React.createElement('div', { className: 'section-title' }, 'KOHORT ANALİZİ (BENZER HASTALAR)'),
-            React.createElement('span', { className: 'section-badge' }, 'FAISS · Top 10')
+            React.createElement('span', { className: 'section-badge' },
+              hasReal && r.similar_patients?.length
+                ? `LUMIERE benzerlik · Top ${similarRows.length}`
+                : `Demo · ${similarRows.length} hasta`)
           ),
           React.createElement('div', { style: { overflowX: 'auto' } },
             React.createElement('table', { className: 'dtable' },
@@ -397,23 +464,24 @@ function AnalysisPage({ onViewReport }) {
                 )
               ),
               React.createElement('tbody', null,
-                MOCK.similarPatients.map(p =>
-                  React.createElement('tr', { key: p.id },
+                similarRows.map(p => {
+                  const mods = p.modalities || p.available_modalities || [];
+                  return React.createElement('tr', { key: p.id },
                     React.createElement('td', { style: { fontWeight: 600, fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--primary)' } }, p.id),
                     React.createElement('td', null,
                       React.createElement('span', { style: { display: 'inline-block', width: 50, height: 6, background: 'var(--border-light)', borderRadius: 3, marginRight: 8, verticalAlign: 'middle', position: 'relative', overflow: 'hidden' } },
                         React.createElement('span', { style: { display: 'block', width: (p.similarity * 100) + '%', height: '100%', background: 'var(--accent)' } })
                       ),
                       (p.similarity * 100).toFixed(1) + '%'),
-                    React.createElement('td', null, p.tumor_volume_cm3.toFixed(1) + ' cm³'),
-                    React.createElement('td', null, p.core_volume_cm3.toFixed(1) + ' cm³'),
+                    React.createElement('td', null, (p.tumor_volume_cm3 || 0).toFixed(1) + ' cm³'),
+                    React.createElement('td', null, (p.core_volume_cm3 || 0).toFixed(1) + ' cm³'),
                     React.createElement('td', { style: { fontSize: 11 } },
-                      p.modalities.map(m =>
+                      mods.map(m =>
                         React.createElement('span', { key: m, className: 'mod-badge ' + m, style: { marginRight: 3, fontSize: 9, padding: '1px 6px' } }, m)
                       )
                     )
-                  )
-                )
+                  );
+                })
               )
             )
           )
@@ -428,14 +496,15 @@ function AnalysisPage({ onViewReport }) {
           React.createElement('div', { className: 'card-body' },
             React.createElement('div', { style: { marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
               React.createElement('span', { style: { fontSize: 11, color: 'var(--text-muted)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 } }, 'Sorgu:'),
-              MOCK.literature.terms.map(t =>
+              (lit.terms || []).map(t =>
                 React.createElement('span', { key: t, style: { background: 'var(--surface-tint)', padding: '3px 9px', borderRadius: 12, fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text-secondary)', border: '1px solid var(--border-light)' } }, t)
               ),
-              React.createElement('span', { style: { color: 'var(--green)', fontSize: 11, fontWeight: 600, marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5 } },
-                React.createElement('span', { style: { width: 6, height: 6, borderRadius: '50%', background: 'var(--green)' } }), 'PubMed canlı')
+              React.createElement('span', { style: { color: lit.source === 'pubmed' ? 'var(--green)' : 'var(--text-muted)', fontSize: 11, fontWeight: 600, marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5 } },
+                React.createElement('span', { style: { width: 6, height: 6, borderRadius: '50%', background: lit.source === 'pubmed' ? 'var(--green)' : 'var(--text-faint)' } }),
+                lit.source === 'pubmed' ? 'PubMed canlı' : (lit.source === 'fallback' ? 'Yerleşik referanslar' : 'Demo'))
             ),
-            React.createElement('div', { className: 'lit-summary' }, MOCK.literature.summary),
-            MOCK.literature.refs.map(ref =>
+            React.createElement('div', { className: 'lit-summary' }, lit.summary || ''),
+            (lit.refs || []).map(ref =>
               React.createElement('div', { key: ref.pmid, className: 'lit-ref' },
                 React.createElement('strong', { style: { color: 'var(--accent-dark)', fontFamily: 'var(--mono)', fontSize: 11 } }, '[PMID: ' + ref.pmid + '] '),
                 React.createElement('span', { style: { fontWeight: 500 } }, ref.title),

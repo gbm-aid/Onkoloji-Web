@@ -24,5 +24,8 @@ __pycache__/
 # Node
 node_modules/
 
+# Local tool settings
+.claude/
+
 # Test sonuçları
 test-results/

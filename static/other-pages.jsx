@@ -469,13 +469,16 @@ function ReportsPage({ patients, selectedPatientId, onSelectPatient, onEditPatie
               maxSlice: maxSlices[viewerAxis],
               onAxisChange: a => { setViewerAxis(a); setViewerSlice(Math.floor(maxSlices[a] / 2)); },
               onSliceChange: setViewerSlice, segOverlay: true,
-              sessionId: patient.session_id || '00e6a88b',
+              sessionId: patient.session_id || 'Patient-001:week-000-1',
               files: (patient.files && patient.files.length) ? patient.files : [
-                { filename: 'T1w.nii',      modality: 'T1',    confidence: 99, shape: [240, 240, 155] },
-                { filename: 'T1c.nii',      modality: 'T1ce',  confidence: 99, shape: [240, 240, 155] },
-                { filename: 'T2w.nii',      modality: 'T2',    confidence: 99, shape: [240, 240, 155] },
-                { filename: 'FLAIR.nii',    modality: 'FLAIR', confidence: 99, shape: [240, 240, 155] },
-                { filename: 'whole.nii.gz', modality: 'SEG',   confidence: 95, shape: [240, 240, 155] },
+                { filename: 'CT1.nii.gz',           modality: 'T1ce',  confidence: 99, shape: [256, 256, 192] },
+                { filename: 'T1.nii.gz',            modality: 'T1',    confidence: 99, shape: [640, 640, 24]  },
+                { filename: 'T2.nii.gz',            modality: 'T2',    confidence: 99, shape: [512, 512, 24]  },
+                { filename: 'FLAIR.nii.gz',         modality: 'FLAIR', confidence: 99, shape: [640, 640, 40]  },
+                { filename: 'ct1_seg_mask.nii.gz',  modality: 'SEG',   confidence: 95, shape: [256, 256, 192] },
+                { filename: 't1_seg_mask.nii.gz',   modality: 'SEG',   confidence: 95, shape: [640, 640, 24]  },
+                { filename: 't2_seg_mask.nii.gz',   modality: 'SEG',   confidence: 95, shape: [512, 512, 24]  },
+                { filename: 'flair_seg_mask.nii.gz',modality: 'SEG',   confidence: 95, shape: [640, 640, 40]  },
               ]
             })
           )
@@ -489,8 +492,8 @@ function MultiTpCompare({ patientId }) {
   const [leftTp, setLeftTp] = React.useState(0);
   const [rightTp, setRightTp] = React.useState(null);
   const [axis, setAxis] = React.useState('axial');
-  const [slice, setSlice] = React.useState(77);
-  const maxSlices = { axial: 154, coronal: 239, sagittal: 239 };
+  const [slice, setSlice] = React.useState(115);
+  const maxSlices = { axial: 191, coronal: 255, sagittal: 255 };
 
   React.useEffect(() => {
     GBM_API.getRano(patientId).then(d => {
@@ -507,17 +510,12 @@ function MultiTpCompare({ patientId }) {
   const lE = events.find(e => e.timepoint === leftTp) || events[0];
   const rE = events.find(e => e.timepoint === rightTp) || events[events.length - 1];
 
-  // Demo session/files (gerçek hastada patient.session_id'den gelir)
-  const DEMO = [
-    { fn: 'T1c.nii',      session: '00e6a88b' },
-    { fn: 'T1c.nii',      session: '2a99c3db' },
-  ];
-  const leftFiles = [
-    { filename: 'T1c.nii', modality: 'T1ce', confidence: 99, shape: [240,240,155] },
-    { filename: 'whole.nii.gz', modality: 'SEG', confidence: 95, shape: [240,240,155] },
-  ];
-  const leftSession = DEMO[Math.min(leftTp, DEMO.length-1)]?.session || '00e6a88b';
-  const rightSession = DEMO[Math.min(rightTp, DEMO.length-1)]?.session || '2a99c3db';
+  // LUMIERE Patient-001'in iki erken timepoint'i — her ikisi de tam DeepBraTumIA segmentasyonuna sahip.
+  // (week-044 ve week-056 yalnızca raw modalite içerdiği için karşılaştırma viewer'ına uygun değil.)
+  const leftSession = 'Patient-001:week-000-1';
+  const rightSession = 'Patient-001:week-000-2';
+  const leftSlice = slice;
+  const rightSlice = slice;
 
   const dV = (rE.tumor_volume_cm3 || 0) - (lE.tumor_volume_cm3 || 0);
   const dPct = lE.tumor_volume_cm3 ? (dV / lE.tumor_volume_cm3 * 100) : 0;
@@ -575,14 +573,14 @@ function MultiTpCompare({ patientId }) {
       React.createElement('div', { style: { display: 'grid',
         gridTemplateColumns: '1fr 1fr', gap: 12 }
       },
-        [{ tp: leftTp, ev: lE, session: leftSession, label: 'TP' + leftTp },
-         { tp: rightTp, ev: rE, session: rightSession, label: 'TP' + rightTp }
+        [{ tp: leftTp, ev: lE, session: leftSession, label: 'TP' + leftTp, sl: leftSlice },
+         { tp: rightTp, ev: rE, session: rightSession, label: 'TP' + rightTp, sl: rightSlice }
         ].map((side, i) =>
           React.createElement('div', { key: i,
             style: { background: '#000', borderRadius: 8, overflow: 'hidden', position: 'relative', aspectRatio: '1' }
           },
             React.createElement('img', {
-              src: GBM_API.getSliceUrl(side.session, 'T1c.nii', axis, slice, ['whole.nii.gz']),
+              src: GBM_API.getSliceUrl(side.session, 'CT1.nii.gz', axis, side.sl, ['ct1_seg_mask.nii.gz']),
               alt: side.label,
               style: { width: '100%', height: '100%', objectFit: 'contain', background: '#000' }
             }),
@@ -779,7 +777,46 @@ function CaseNotes({ patientId }) {
 
 /* ━━━ COHORT PAGE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 function CohortPage() {
-  const s = MOCK.cohortStats;
+  const [s, setS] = React.useState(null);
+  const [km, setKm] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+
+  React.useEffect(() => {
+    Promise.all([
+      GBM_API.getCohortStats(),
+      GBM_API.getCohortKM({ stratify: 'risk_class' }),
+    ]).then(([stats, kmData]) => {
+      setS(stats);
+      setKm(kmData);
+      setLoading(false);
+    });
+  }, []);
+
+  if (loading) {
+    return React.createElement('div', { className: 'page-fade', style: { padding: 60, textAlign: 'center', color: 'var(--text-muted)' } },
+      React.createElement('div', { style: { width: 36, height: 36, margin: '0 auto 12px', border: '3px solid var(--border)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' } }),
+      'Kohort verileri yükleniyor...'
+    );
+  }
+  if (!s) {
+    return React.createElement('div', { className: 'page-fade', style: { padding: 60, textAlign: 'center', color: 'var(--text-muted)' } },
+      'Kohort verisi alınamadı.');
+  }
+
+  const rd = s.risk_dist || {};
+  const md = s.mgmt_dist || {};
+  const id1 = s.idh1_dist || {};
+  const ab = s.age_bins || {};
+
+  // Backend Türkçe ('bilinmiyor') + null keyleri döndürebilir; her iki varyantı topla.
+  const mUnk = (md['bilinmiyor'] || 0) + (md['unknown'] || 0) + (md['null'] || 0);
+  const iUnk = (id1['bilinmiyor'] || 0) + (id1['unknown'] || 0) + (id1['null'] || 0);
+
+  const kmCurves = (km?.curves || []).map(c => ({
+    label: c.label, color: c.color, n0: c.n0,
+    events: c.events || [], censored: c.censored || [],
+  }));
+
   return React.createElement('div', { className: 'page-fade' },
     React.createElement('div', { className: 'kpi-row' },
       [
@@ -796,14 +833,18 @@ function CohortPage() {
       )
     ),
 
-    // Kaplan-Meier full width
+    // Kaplan-Meier full width — gerçek survival_days üzerinden product-limit
     React.createElement('div', { className: 'card' },
       React.createElement('div', { className: 'section-head' },
         React.createElement('div', { className: 'section-title' }, 'KAPLAN-MEIER SAĞKALIM EĞRİSİ'),
-        React.createElement('span', { className: 'section-badge' }, 'Risk gruplarına göre · 24 ay')
+        React.createElement('span', { className: 'section-badge' },
+          km ? `${km.total_filtered || 0} hasta · Risk gruplarına göre` : 'Risk gruplarına göre · 24 ay')
       ),
       React.createElement('div', { className: 'card-body' },
-        React.createElement(KaplanMeier, { curves: MOCK.kmCurves, height: 280 })
+        kmCurves.length
+          ? React.createElement(KaplanMeier, { curves: kmCurves, height: 280 })
+          : React.createElement('div', { style: { padding: 40, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 } },
+              'Sağkalım verisi olan hasta bulunamadı.')
       )
     ),
 
@@ -814,7 +855,7 @@ function CohortPage() {
           React.createElement('div', { className: 'section-title' }, 'RİSK SINIFI DAĞILIMI')),
         React.createElement('div', { className: 'card-body' },
           React.createElement(DonutChart, {
-            data: { 'Düşük': s.risk_dist.low, 'Orta': s.risk_dist.medium, 'Yüksek': s.risk_dist.high },
+            data: { 'Düşük': rd.low || 0, 'Orta': rd.medium || 0, 'Yüksek': rd.high || 0 },
             colors: { 'Düşük': 'var(--green)', 'Orta': 'var(--yellow)', 'Yüksek': 'var(--red)' },
             size: 160, thickness: 26
           })
@@ -824,7 +865,7 @@ function CohortPage() {
         React.createElement('div', { className: 'section-head' },
           React.createElement('div', { className: 'section-title' }, 'YAŞ DAĞILIMI')),
         React.createElement('div', { className: 'card-body' },
-          React.createElement(StatBarChart, { data: s.age_bins, colorMap: {} })
+          React.createElement(StatBarChart, { data: ab, colorMap: {} })
         )
       )
     ),
@@ -835,7 +876,7 @@ function CohortPage() {
           React.createElement('div', { className: 'section-title' }, 'MGMT METİLASYON')),
         React.createElement('div', { className: 'card-body' },
           React.createElement(DonutChart, {
-            data: { 'Metile': s.mgmt_dist.methylated, 'Metile Değil': s.mgmt_dist.unmethylated, 'Bilinmiyor': s.mgmt_dist.unknown },
+            data: { 'Metile': md.methylated || 0, 'Metile Değil': md.unmethylated || 0, 'Bilinmiyor': mUnk },
             colors: { 'Metile': 'var(--green)', 'Metile Değil': 'var(--red)', 'Bilinmiyor': 'var(--text-faint)' },
             size: 160, thickness: 26
           })
@@ -846,7 +887,7 @@ function CohortPage() {
           React.createElement('div', { className: 'section-title' }, 'IDH1 MUTASYON')),
         React.createElement('div', { className: 'card-body' },
           React.createElement(DonutChart, {
-            data: { 'Mutant': s.idh1_dist.mutant, 'Wildtype': s.idh1_dist.wildtype, 'Bilinmiyor': s.idh1_dist.unknown },
+            data: { 'Mutant': id1.mutant || 0, 'Wildtype': id1.wildtype || 0, 'Bilinmiyor': iUnk },
             colors: { 'Mutant': 'var(--blue)', 'Wildtype': 'var(--orange)', 'Bilinmiyor': 'var(--text-faint)' },
             size: 160, thickness: 26
           })
@@ -908,29 +949,41 @@ function HelpPage() {
 
 /* ━━━ SCIENCE / VALIDATION PAGE ━━━━━━━━━━━━━━━━━━━━━ */
 function SciencePage() {
+  // --- State -----------------------------------------------------------
+  const [perf, setPerf] = React.useState(null);
+  const [roc, setRoc] = React.useState(null);
+  const [feats, setFeats] = React.useState(null);
+  const [calib, setCalib] = React.useState(null);
+  const [card, setCard] = React.useState(null);
+  const [kmData, setKmData] = React.useState(null);
+  const [kmLoading, setKmLoading] = React.useState(true);
   const [filters, setFilters] = React.useState({
     mgmt: '', idh1: '', gender: '',
     age_min: '', age_max: '', kps_min: '', kps_max: '',
-    stratify: 'mgmt',
+    stratify: 'risk_class',
   });
-  const [kmData, setKmData] = React.useState(null);
-  const [calib, setCalib] = React.useState(null);
-  const [card, setCard] = React.useState(null);
-  const [loading, setLoading] = React.useState(true);
 
-  const reloadKM = React.useCallback(async () => {
-    setLoading(true);
-    const r = await GBM_API.getCohortKM(filters);
-    setKmData(r);
-    setLoading(false);
-  }, [filters]);
-  React.useEffect(() => { reloadKM(); }, [reloadKM]);
   React.useEffect(() => {
+    GBM_API.getSciencePerformance().then(setPerf);
+    GBM_API.getScienceROC().then(setRoc);
+    GBM_API.getScienceFeatureEffects().then(setFeats);
     GBM_API.getCalibration().then(setCalib);
     GBM_API.getModelCard().then(setCard);
   }, []);
 
+  const reloadKM = React.useCallback(async () => {
+    setKmLoading(true);
+    const r = await GBM_API.getCohortKM(filters);
+    setKmData(r);
+    setKmLoading(false);
+  }, [filters]);
+  React.useEffect(() => { reloadKM(); }, [reloadKM]);
+
   const setF = (k, v) => setFilters(prev => ({ ...prev, [k]: v }));
+  const resetFilters = () => setFilters({
+    mgmt: '', idh1: '', gender: '', age_min: '', age_max: '', kps_min: '', kps_max: '',
+    stratify: filters.stratify,
+  });
 
   const MGMT_OPTS = [
     { v: 'methylated', l: 'Metile' }, { v: 'unmethylated', l: 'Metile Değil' },
@@ -951,31 +1004,191 @@ function SciencePage() {
     events: c.events || [], censored: c.censored || [],
   }));
 
+  // --- Yardımcı bileşenler ---------------------------------------------
+  const MetricCard = ({ label, value, sub, color, hint }) =>
+    React.createElement('div', {
+      style: { background: 'var(--surface)', border: '1px solid var(--border-light)',
+               borderRadius: 8, padding: '14px 16px', position: 'relative' }
+    },
+      React.createElement('div', { style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6,
+        textTransform: 'uppercase', color: 'var(--text-muted)' } }, label),
+      React.createElement('div', { style: { fontSize: 26, fontWeight: 800, fontFamily: 'var(--mono)',
+        color: color || 'var(--text)', marginTop: 4, lineHeight: 1.1 } },
+        value != null ? value : '—'),
+      sub && React.createElement('div', { style: { fontSize: 11, color: 'var(--text-muted)',
+        marginTop: 4, fontFamily: 'var(--mono)' } }, sub),
+      hint && React.createElement('div', {
+        title: hint,
+        style: { position: 'absolute', top: 8, right: 10, fontSize: 12,
+                 color: 'var(--text-faint)', cursor: 'help', userSelect: 'none' }
+      }, 'ⓘ')
+    );
+
+  // Renk skalası: AUC/C-index için (>0.8 yeşil, 0.7 sarı, <0.6 kırmızı)
+  const aucColor = v => v == null ? 'var(--text)' : v >= 0.8 ? 'var(--green)' : v >= 0.7 ? 'var(--yellow)' : v >= 0.6 ? 'var(--orange, #f97316)' : 'var(--red)';
+  // ECE/Brier için (düşük iyi)
+  const lowGoodColor = v => v == null ? 'var(--text)' : v <= 0.05 ? 'var(--green)' : v <= 0.10 ? 'var(--yellow)' : 'var(--red)';
+
+  // --- Render ----------------------------------------------------------
   return React.createElement('div', { className: 'page-fade' },
-    // Header banner
-    React.createElement('div', { className: 'card', style: { borderLeft: '4px solid var(--accent)', background: 'linear-gradient(135deg, var(--surface) 0%, var(--accent-light) 100%)' } },
+
+    // ── HERO + KPI ────────────────────────────────────────────────────
+    React.createElement('div', { className: 'card', style: { borderLeft: '4px solid var(--accent)',
+      background: 'linear-gradient(135deg, var(--surface) 0%, var(--accent-light) 100%)' } },
       React.createElement('div', { className: 'section-head', style: { borderBottom: 'none' } },
         React.createElement('div', { className: 'section-title' }, 'BİLİM & MODEL DOĞRULAMA'),
-        React.createElement('span', { className: 'section-badge' }, 'Yayın-grade analiz')
+        React.createElement('span', { className: 'section-badge', style: { fontFamily: 'var(--mono)' } },
+          perf?.model_version || 'v5.0')
       ),
-      React.createElement('div', { className: 'card-body', style: { paddingTop: 0, fontSize: 13, color: 'var(--text-secondary)' } },
-        'Modelin gerçek hasta verisi üzerindeki performansını ve filtrelenebilir kohort sağkalım eğrilerini inceleyin. ' +
-        'Tüm grafikler canlı veriden hesaplanır.'
+      React.createElement('div', { className: 'card-body', style: { paddingTop: 0, fontSize: 12.5,
+        color: 'var(--text-secondary)' } },
+        'Modelin gerçek hasta verisi üzerindeki ayrım gücü (discrimination), kalibrasyonu, ',
+        'öznitelik etkileri ve kohort sağkalım istatistikleri.')
+    ),
+
+    // KPI grid
+    React.createElement('div', { style: { display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12, marginBottom: 16 } },
+      React.createElement(MetricCard, {
+        label: 'Harrell C-index', value: perf?.c_index?.toFixed(3),
+        sub: `n=${perf?.n_total || 0} olay·${perf?.n_events || 0}`,
+        color: aucColor(perf?.c_index),
+        hint: '0.5: rastgele · 0.7+: makul · 0.8+: iyi'
+      }),
+      React.createElement(MetricCard, {
+        label: 'AUC (6 ay)', value: perf?.auc_6m?.toFixed(3),
+        sub: perf?.auc_6m_ci ? `95% CI ${perf.auc_6m_ci[0].toFixed(2)}–${perf.auc_6m_ci[1].toFixed(2)}` : null,
+        color: aucColor(perf?.auc_6m),
+        hint: 'ROC altında kalan alan — sağkalım/ölüm ayrımı'
+      }),
+      React.createElement(MetricCard, {
+        label: 'Brier Skoru', value: perf?.brier_6m?.toFixed(4),
+        sub: 'Düşük = iyi',
+        color: lowGoodColor(perf?.brier_6m),
+        hint: 'Ortalama kuadratik tahmin hatası (0=mükemmel · 0.25=rastgele)'
+      }),
+      React.createElement(MetricCard, {
+        label: 'ECE', value: perf?.ece_6m?.toFixed(4),
+        sub: 'Expected Calibration Error',
+        color: lowGoodColor(perf?.ece_6m),
+        hint: 'Tahmin olasılıkları ile gerçek frekanslar arasındaki ortalama fark'
+      }),
+      React.createElement(MetricCard, {
+        label: 'CV Doğruluk (6m)', value: perf?.cv_accuracy_6m ? '%' + (perf.cv_accuracy_6m * 100).toFixed(1) : null,
+        sub: `Eğitim n=${perf?.training_n || '?'}`,
+        color: aucColor(perf?.cv_accuracy_6m),
+        hint: 'Stratified k-fold cross-validation doğruluğu (kalibrasyondan)'
+      }),
+      React.createElement(MetricCard, {
+        label: 'Risk Modeli R²', value: perf?.risk_model_r2?.toFixed(3),
+        sub: 'Linear reg. açıklanan varyans',
+        color: perf?.risk_model_r2 > 0.5 ? 'var(--green)' : perf?.risk_model_r2 > 0.3 ? 'var(--yellow)' : 'var(--red)',
+        hint: 'Risk skoru regresyon modelinin uyum kalitesi'
+      })
+    ),
+
+    // ── DISCRIMINATION: ROC ───────────────────────────────────────────
+    React.createElement('div', { className: 'card' },
+      React.createElement('div', { className: 'section-head' },
+        React.createElement('div', { className: 'section-title' }, 'AYRIM GÜCÜ — ROC EĞRİSİ'),
+        React.createElement('span', { className: 'section-badge' },
+          roc?.n ? `n=${roc.n} · pozitif=${roc.n_positive}` : 'Yok')
+      ),
+      React.createElement('div', { className: 'card-body' },
+        !roc
+          ? React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)' } }, 'Yükleniyor...')
+          : !roc.points?.length
+          ? React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 } },
+              roc.note || 'ROC verisi yok')
+          : React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 220px', gap: 18, alignItems: 'center' } },
+              React.createElement(ROCCurve, {
+                points: roc.points, auc: roc.auc, ci: roc.auc_ci,
+                label: roc.outcome || '6 Aylık Sağkalım'
+              }),
+              React.createElement('div', { style: { fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 } },
+                React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)', fontSize: 12.5, marginBottom: 6 } }, 'Yorumlama'),
+                'AUC, modelin sağkalan ve sağkalmayan iki hasta arasında doğru sıralama yapma olasılığıdır. ',
+                React.createElement('br'),
+                React.createElement('br'),
+                roc.auc >= 0.8 ? '✓ İyi ayrım gücü.' :
+                  roc.auc >= 0.7 ? '○ Makul ayrım gücü.' :
+                  roc.auc >= 0.6 ? '△ Sınırlı ayrım gücü.' : '✗ Zayıf — modelin yeniden değerlendirilmesi önerilir.',
+                React.createElement('br'),
+                React.createElement('br'),
+                React.createElement('span', { style: { fontSize: 11, color: 'var(--text-muted)' } },
+                  `Outcome: ${roc.outcome}`)
+              )
+          )
       )
     ),
 
-    // Filter panel
+    // ── CALIBRATION + FEATURE EFFECTS yan yana ────────────────────────
+    React.createElement('div', { className: 'grid-2col' },
+      // Calibration
+      React.createElement('div', { className: 'card' },
+        React.createElement('div', { className: 'section-head' },
+          React.createElement('div', { className: 'section-title' }, 'KALİBRASYON — RELIABILITY DIAGRAM'),
+          React.createElement('span', { className: 'section-badge' }, calib?.n ? `n=${calib.n}` : '0')
+        ),
+        React.createElement('div', { className: 'card-body' },
+          !calib ? React.createElement('div', { style: { padding: 20, textAlign: 'center', color: 'var(--text-muted)' } }, 'Yükleniyor...')
+            : calib.n === 0 ? React.createElement('div', { style: { padding: 20, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12.5 } }, calib.note || 'Yeterli veri yok')
+            : React.createElement(CalibrationPlot, { bins: calib.bins, brier: calib.brier_score, height: 320 })
+        )
+      ),
+      // Feature effects (forest plot)
+      React.createElement('div', { className: 'card' },
+        React.createElement('div', { className: 'section-head' },
+          React.createElement('div', { className: 'section-title' }, 'ÖZNİTELİK ETKİLERİ — RİSK SKORU'),
+          React.createElement('span', { className: 'section-badge' },
+            feats?.training_n ? `Eğitim n=${feats.training_n}` : 'Yok')
+        ),
+        React.createElement('div', { className: 'card-body' },
+          !feats || !feats.features?.length
+            ? React.createElement('div', { style: { padding: 20, textAlign: 'center', color: 'var(--text-muted)' } }, 'Yükleniyor...')
+            : React.createElement(React.Fragment, null,
+                React.createElement(ForestPlot, {
+                  items: feats.features.map(f => ({
+                    label: f.label, value: f.risk_coef,
+                    color: f.direction === 'high_risk' ? '#b91c1c' : '#15803d',
+                  })),
+                  neutral: 0, unit: 'standartlaştırılmış coef'
+                }),
+                React.createElement('div', { style: { fontSize: 11, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 } },
+                  React.createElement('strong', null, 'Yorumlama:'),
+                  ' Pozitif değer (sağ) → riski artırır · Negatif (sol) → azaltır. ',
+                  'Standartlaştırılmış öznitelikler üzerinden hesaplandığı için coef\'in mutlak değeri göreceli önemi gösterir.'),
+                feats.skipped_zero_variance?.length > 0 && React.createElement('div', {
+                  style: { fontSize: 11, color: 'var(--text-faint)', marginTop: 6, lineHeight: 1.5,
+                           fontStyle: 'italic' }
+                },
+                  '⚠ Eğitim verisinde varyans göstermediği için göz ardı edildi: ' +
+                  feats.skipped_zero_variance.join(', '))
+              )
+        )
+      )
+    ),
+
+    // ── KOHORT SAĞKALIM EĞRİSİ ────────────────────────────────────────
     React.createElement('div', { className: 'card' },
       React.createElement('div', { className: 'section-head' },
-        React.createElement('div', { className: 'section-title' }, 'KOHORT FİLTRELERİ'),
-        kmData && React.createElement('span', { className: 'section-badge' },
-          `${kmData.total_filtered} hasta · ${cohortCurves.length} stratum`)
+        React.createElement('div', { className: 'section-title' }, 'KOHORT SAĞKALIM EĞRİSİ'),
+        React.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },
+          kmData && React.createElement('span', { className: 'section-badge' },
+            `${kmData.total_filtered || 0} hasta · ${cohortCurves.length} stratum`),
+          kmData?.logrank_p != null && React.createElement('span', {
+            className: 'section-badge',
+            style: { fontFamily: 'var(--mono)',
+              background: kmData.logrank_p < 0.05 ? 'rgba(21,128,61,0.12)' : 'rgba(180,83,9,0.12)',
+              color: kmData.logrank_p < 0.05 ? 'var(--green)' : 'var(--yellow)' }
+          }, 'Log-rank p=' + (kmData.logrank_p < 0.001 ? '<0.001' : kmData.logrank_p.toFixed(3)))
+        )
       ),
-      React.createElement('div', { className: 'card-body', style: { display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }
-      },
-        // MGMT multi-select (single for now)
-        React.createElement('div', { className: 'form-group' },
+      // Filter row
+      React.createElement('div', { style: { padding: '10px 16px', background: 'var(--surface-tint)',
+        display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10,
+        borderBottom: '1px solid var(--border-light)' } },
+        React.createElement('div', { className: 'form-group', style: { margin: 0 } },
           React.createElement('label', { className: 'form-label' }, 'MGMT'),
           React.createElement('select', { className: 'form-select', value: filters.mgmt,
             onChange: e => setF('mgmt', e.target.value) },
@@ -983,7 +1196,7 @@ function SciencePage() {
             MGMT_OPTS.map(o => React.createElement('option', { key: o.v, value: o.v }, o.l))
           )
         ),
-        React.createElement('div', { className: 'form-group' },
+        React.createElement('div', { className: 'form-group', style: { margin: 0 } },
           React.createElement('label', { className: 'form-label' }, 'IDH1'),
           React.createElement('select', { className: 'form-select', value: filters.idh1,
             onChange: e => setF('idh1', e.target.value) },
@@ -991,7 +1204,7 @@ function SciencePage() {
             IDH_OPTS.map(o => React.createElement('option', { key: o.v, value: o.v }, o.l))
           )
         ),
-        React.createElement('div', { className: 'form-group' },
+        React.createElement('div', { className: 'form-group', style: { margin: 0 } },
           React.createElement('label', { className: 'form-label' }, 'Cinsiyet'),
           React.createElement('select', { className: 'form-select', value: filters.gender,
             onChange: e => setF('gender', e.target.value) },
@@ -1000,8 +1213,8 @@ function SciencePage() {
             React.createElement('option', { value: 'F' }, 'Kadın')
           )
         ),
-        React.createElement('div', { className: 'form-group' },
-          React.createElement('label', { className: 'form-label' }, 'Yaş (min–max)'),
+        React.createElement('div', { className: 'form-group', style: { margin: 0 } },
+          React.createElement('label', { className: 'form-label' }, 'Yaş'),
           React.createElement('div', { style: { display: 'flex', gap: 4 } },
             React.createElement('input', { className: 'form-input', type: 'number', placeholder: '18',
               value: filters.age_min, onChange: e => setF('age_min', e.target.value) }),
@@ -1009,121 +1222,118 @@ function SciencePage() {
               value: filters.age_max, onChange: e => setF('age_max', e.target.value) })
           )
         ),
-        React.createElement('div', { className: 'form-group' },
-          React.createElement('label', { className: 'form-label' }, 'KPS (min–max)'),
-          React.createElement('div', { style: { display: 'flex', gap: 4 } },
-            React.createElement('input', { className: 'form-input', type: 'number', placeholder: '40',
-              value: filters.kps_min, onChange: e => setF('kps_min', e.target.value) }),
-            React.createElement('input', { className: 'form-input', type: 'number', placeholder: '100',
-              value: filters.kps_max, onChange: e => setF('kps_max', e.target.value) })
-          )
-        ),
-        React.createElement('div', { className: 'form-group' },
-          React.createElement('label', { className: 'form-label' }, 'Stratifiye et'),
+        React.createElement('div', { className: 'form-group', style: { margin: 0 } },
+          React.createElement('label', { className: 'form-label' }, 'Stratifiye'),
           React.createElement('select', { className: 'form-select', value: filters.stratify,
             onChange: e => setF('stratify', e.target.value) },
             STRAT_OPTS.map(o => React.createElement('option', { key: o.v, value: o.v }, o.l))
           )
+        ),
+        React.createElement('div', { style: { display: 'flex', alignItems: 'flex-end' } },
+          React.createElement('button', { className: 'btn btn-outline btn-sm',
+            onClick: resetFilters, style: { width: '100%' } }, '↺ Sıfırla')
         )
-      )
-    ),
-
-    // KM curves
-    React.createElement('div', { className: 'card' },
-      React.createElement('div', { className: 'section-head' },
-        React.createElement('div', { className: 'section-title' }, 'KOHORT SAĞKALIM EĞRİSİ'),
-        React.createElement('span', { className: 'section-badge' },
-          'Gerçek survival_days · Product-limit')
       ),
       React.createElement('div', { className: 'card-body' },
-        loading
+        kmLoading
           ? React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)' } }, 'Yükleniyor...')
           : cohortCurves.length === 0
-          ? React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)' } },
-              'Bu filtrelerle hiç hasta yok.')
-          : React.createElement(KaplanMeier, { curves: cohortCurves, height: 320,
-              maxTime: kmData?.max_months || 36 })
-      )
-    ),
-
-    // Calibration + Model Card side-by-side
-    React.createElement('div', { className: 'grid-2col' },
-      // Calibration
-      React.createElement('div', { className: 'card' },
-        React.createElement('div', { className: 'section-head' },
-          React.createElement('div', { className: 'section-title' }, 'KALİBRASYON DİYAGRAMI'),
-          React.createElement('span', { className: 'section-badge' },
-            calib?.n ? `n=${calib.n}` : '0 örnek')
-        ),
-        React.createElement('div', { className: 'card-body' },
-          !calib
-            ? React.createElement('div', { style: { color: 'var(--text-muted)', padding: 20, textAlign: 'center' } }, 'Yükleniyor...')
-            : calib.n === 0
-            ? React.createElement('div', { style: { color: 'var(--text-muted)', padding: 20, textAlign: 'center', fontSize: 12.5 } },
-                calib.note || 'Yeterli veri yok')
-            : React.createElement(CalibrationPlot, { bins: calib.bins, brier: calib.brier_score, height: 320 })
-        )
-      ),
-      // Model Card
-      React.createElement('div', { className: 'card' },
-        React.createElement('div', { className: 'section-head' },
-          React.createElement('div', { className: 'section-title' }, 'MODEL KARTI'),
-          card && React.createElement('span', { className: 'section-badge', style: { fontFamily: 'var(--mono)' } },
-            card.model_version)
-        ),
-        React.createElement('div', { className: 'card-body', style: { fontSize: 12.5, color: 'var(--text-secondary)', lineHeight: 1.55 } },
-          !card
-            ? 'Yükleniyor...'
-            : React.createElement(React.Fragment, null,
-                React.createElement('div', { style: { marginBottom: 10 } },
-                  React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)' } }, 'Model Tipi'),
-                  card.model_type
-                ),
-                React.createElement('div', { style: { marginBottom: 10 } },
-                  React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)' } },
-                    `Eğitim Verisi (n=${card.training?.n_train || '?'})`),
-                  card.training?.source
-                ),
-                React.createElement('div', { style: { marginBottom: 10 } },
-                  React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)' } }, 'Öznitelikler'),
-                  React.createElement('div', { style: { fontSize: 11.5, color: 'var(--text-muted)' } },
-                    (card.training?.features || []).join(' · '))
-                ),
-                React.createElement('div', { style: { marginBottom: 10 } },
-                  React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)' } }, 'Doğrulama'),
-                  card.validation?.method
-                ),
-                React.createElement('div', { style: { marginBottom: 10 } },
-                  React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)' } }, 'Sınırlamalar'),
-                  React.createElement('ul', { style: { margin: '4px 0 0 18px', padding: 0, fontSize: 12 } },
-                    (card.limitations || []).map((l, i) => React.createElement('li', { key: i, style: { marginBottom: 2 } }, l))
+          ? React.createElement('div', { style: { padding: 30, textAlign: 'center', color: 'var(--text-muted)' } }, 'Bu filtrelerle hiç hasta yok.')
+          : React.createElement(React.Fragment, null,
+              React.createElement(KaplanMeier, { curves: cohortCurves, height: 320,
+                maxTime: kmData?.max_months || 36 }),
+              // Stratum tablosu (medyan + n + events)
+              React.createElement('table', { className: 'dtable',
+                style: { marginTop: 12, fontSize: 12.5 } },
+                React.createElement('thead', null,
+                  React.createElement('tr', null,
+                    React.createElement('th', null, 'Stratum'),
+                    React.createElement('th', { style: { textAlign: 'right' } }, 'n'),
+                    React.createElement('th', { style: { textAlign: 'right' } }, 'Ölüm'),
+                    React.createElement('th', { style: { textAlign: 'right' } }, 'Sansür'),
+                    React.createElement('th', { style: { textAlign: 'right' } }, 'Medyan (ay)')
                   )
+                ),
+                React.createElement('tbody', null,
+                  (kmData?.curves || []).map(c => React.createElement('tr', { key: c.label },
+                    React.createElement('td', null,
+                      React.createElement('span', { style: { display: 'inline-block',
+                        width: 10, height: 10, background: c.color, borderRadius: 2,
+                        marginRight: 8, verticalAlign: 'middle' } }),
+                      React.createElement('span', { style: { fontWeight: 600 } }, c.label)),
+                    React.createElement('td', { style: { textAlign: 'right', fontFamily: 'var(--mono)' } }, c.n0),
+                    React.createElement('td', { style: { textAlign: 'right', fontFamily: 'var(--mono)' } }, c.n_events),
+                    React.createElement('td', { style: { textAlign: 'right', fontFamily: 'var(--mono)' } }, c.n_censored),
+                    React.createElement('td', { style: { textAlign: 'right', fontFamily: 'var(--mono)', fontWeight: 700 } },
+                      c.median_months != null ? c.median_months.toFixed(1) : '—')
+                  ))
                 )
               )
-        )
+          )
       )
     ),
 
-    // Database stats footer
+    // ── MODEL KARTI ───────────────────────────────────────────────────
+    React.createElement('div', { className: 'card' },
+      React.createElement('div', { className: 'section-head' },
+        React.createElement('div', { className: 'section-title' }, 'MODEL KARTI'),
+        card && React.createElement('span', { className: 'section-badge', style: { fontFamily: 'var(--mono)' } },
+          card.model_version)
+      ),
+      React.createElement('div', { className: 'card-body', style: { fontSize: 12.5,
+        color: 'var(--text-secondary)', lineHeight: 1.55 } },
+        !card ? 'Yükleniyor...'
+          : React.createElement('div', { style: { display: 'grid',
+              gridTemplateColumns: '1fr 1fr', gap: 24 } },
+              React.createElement('div', null,
+                React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)', marginBottom: 3 } }, 'Model Tipi'),
+                card.model_type, React.createElement('br'),
+                React.createElement('div', { style: { marginTop: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 3 } },
+                  `Eğitim Verisi (n=${card.training?.n_train || '?'})`),
+                card.training?.source, React.createElement('br'),
+                React.createElement('div', { style: { marginTop: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 3 } }, 'Öznitelikler'),
+                React.createElement('div', { style: { fontSize: 12, color: 'var(--text-muted)' } },
+                  (card.training?.features || []).join(' · ')),
+                React.createElement('div', { style: { marginTop: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 3 } }, 'Doğrulama'),
+                card.validation?.method
+              ),
+              React.createElement('div', null,
+                React.createElement('div', { style: { fontWeight: 700, color: 'var(--text)', marginBottom: 3 } }, 'Sınırlamalar'),
+                React.createElement('ul', { style: { margin: '0 0 0 16px', padding: 0, fontSize: 12 } },
+                  (card.limitations || []).map((l, i) => React.createElement('li', { key: i, style: { marginBottom: 4 } }, l))
+                ),
+                React.createElement('div', { style: { marginTop: 14, padding: 10,
+                  background: 'var(--surface-tint)', borderRadius: 6, fontSize: 12,
+                  borderLeft: '3px solid var(--accent)' } },
+                  React.createElement('strong', null, 'Kullanım Amacı: '),
+                  card.intended_use)
+              )
+            )
+      )
+    ),
+
+    // ── Database stats footer ─────────────────────────────────────────
     card && React.createElement('div', { className: 'card' },
       React.createElement('div', { className: 'section-head' },
         React.createElement('div', { className: 'section-title' }, 'CANLI VERİTABANI İSTATİSTİKLERİ')),
       React.createElement('div', { className: 'card-body', style: { display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 14 }
-      },
+        gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 14 } },
         [
           { l: 'Toplam Hasta', v: card.database_stats?.total_patients },
           { l: 'Analiz Edilmiş', v: card.database_stats?.analyzed },
           { l: 'Bilinen Sonuç', v: card.database_stats?.with_known_outcome },
           { l: 'Vefat Eden', v: card.database_stats?.deceased },
-        ].map((s, i) => React.createElement('div', { key: i, style: { textAlign: 'center', padding: 10, background: 'var(--surface-tint)', borderRadius: 6 } },
-          React.createElement('div', { style: { fontSize: 22, fontWeight: 800, color: 'var(--text)', fontFamily: 'var(--mono)' } }, s.v ?? '—'),
-          React.createElement('div', { style: { fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600, marginTop: 4 } }, s.l)
+        ].map((s, i) => React.createElement('div', { key: i,
+          style: { textAlign: 'center', padding: 10, background: 'var(--surface-tint)', borderRadius: 6 } },
+          React.createElement('div', { style: { fontSize: 22, fontWeight: 800,
+            color: 'var(--text)', fontFamily: 'var(--mono)' }, }, s.v ?? '—'),
+          React.createElement('div', { style: { fontSize: 11, color: 'var(--text-muted)',
+            textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 600, marginTop: 4 } }, s.l)
         ))
       )
     ),
 
-    // References
+    // ── References ────────────────────────────────────────────────────
     card?.references?.length > 0 && React.createElement('div', { className: 'card' },
       React.createElement('div', { className: 'section-head' },
         React.createElement('div', { className: 'section-title' }, 'KAYNAKLAR')),
